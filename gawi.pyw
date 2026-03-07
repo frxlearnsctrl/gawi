@@ -381,12 +381,29 @@ class GawiApp:
                 if b_end_local <= b_start_local:
                     b_end_local += timedelta(days=1)
                 # Convert to UTC
+                a_cross = a['end_h'] * 60 + a['end_m'] <= a['start_h'] * 60 + a['start_m']
+                b_cross = b['end_h'] * 60 + b['end_m'] <= b['start_h'] * 60 + b['start_m']
                 a_utc_s = self.convert_zone_to_utc(a_start_local, a['zone'])
                 a_utc_e = self.convert_zone_to_utc(a_end_local, a['zone'])
                 b_utc_s = self.convert_zone_to_utc(b_start_local, b['zone'])
                 b_utc_e = self.convert_zone_to_utc(b_end_local, b['zone'])
-                # Overlap check: two intervals overlap if start_a < end_b AND start_b < end_a
-                if a_utc_s < b_utc_e and b_utc_s < a_utc_e:
+                # Cross-midnight blocks span two calendar days, so also check shifted -1 day
+                a_intervals = [(a_utc_s, a_utc_e)]
+                if a_cross:
+                    a_intervals.append((a_utc_s - timedelta(days=1), a_utc_e - timedelta(days=1)))
+                b_intervals = [(b_utc_s, b_utc_e)]
+                if b_cross:
+                    b_intervals.append((b_utc_s - timedelta(days=1), b_utc_e - timedelta(days=1)))
+                # Overlap check: any pair of intervals overlaps
+                overlap_found = False
+                for as_, ae_ in a_intervals:
+                    for bs_, be_ in b_intervals:
+                        if as_ < be_ and bs_ < ae_:
+                            overlap_found = True
+                            break
+                    if overlap_found:
+                        break
+                if overlap_found:
                     day_names = {0:"Mon",1:"Tue",2:"Wed",3:"Thu",4:"Fri",5:"Sat",6:"Sun"}
                     shared_str = ",".join(day_names.get(int(d), d) for d in sorted(shared_days))
                     explanation = f"{a['zone']} {a['start_h']:02d}:{a['start_m']:02d}-{a['end_h']:02d}:{a['end_m']:02d} overlaps {b['zone']} {b['start_h']:02d}:{b['start_m']:02d}-{b['end_h']:02d}:{b['end_m']:02d} on {shared_str}"
@@ -2126,6 +2143,11 @@ class GawiApp:
         self.popup_color = data['popup_bg_color'] if data['popup_bg_color'] else "#111111"
         self.color_preview.config(bg=self.popup_color)
         
+        self.var_enable_snooze.set(data.get('enable_snooze', 1))
+        self.v_max_snoozes.set(str(data.get('max_snoozes', 3)))
+        self.v_snooze_behavior.set(data.get('snooze_behavior', 'shift'))
+        self.toggle_snooze_entry()
+
         self.var_one_time.set(data.get('is_one_time', 0))
         if data.get('one_time_date'):
             try:
