@@ -343,7 +343,8 @@ class GawiApp:
         for block in sorted(self.tz_blocks, key=lambda b: b['sort_order']):
             zone_time = self.convert_utc_to_zone(now_utc, block['zone'])
             weekday = zone_time.weekday()
-            if str(weekday) not in block['active_days'].split(','):
+            active_days = block.get('active_days') or '0,1,2,3,4'
+            if str(weekday) not in active_days.split(','):
                 continue
             now_mins = zone_time.hour * 60 + zone_time.minute
             start_mins = block['start_h'] * 60 + block['start_m']
@@ -356,44 +357,36 @@ class GawiApp:
                     return block['zone']
         return self._get_personal_zone()
 
-    def detect_tz_blocks_conflicts(self):
+    def detect_tz_blocks_conflicts(self, ref_utc=None):
+        if ref_utc is None:
+            ref_utc = self.get_now_utc()
         conflicts = []
         blocks = sorted(self.tz_blocks, key=lambda b: b['sort_order'])
+        ref_date = ref_utc.replace(hour=0, minute=0, second=0, microsecond=0)
         for i in range(len(blocks)):
             for j in range(i + 1, len(blocks)):
                 a, b = blocks[i], blocks[j]
-                days_a = set(a['active_days'].split(','))
-                days_b = set(b['active_days'].split(','))
-                shared_days = days_a & days_b
+                a_days = (a.get('active_days') or '0,1,2,3,4').split(',')
+                b_days = (b.get('active_days') or '0,1,2,3,4').split(',')
+                shared_days = set(a_days) & set(b_days)
                 if not shared_days:
                     continue
-                # Convert both to UTC minute ranges for a reference day
-                now_utc = self.get_now_utc()
-                a_start_mins = a['start_h'] * 60 + a['start_m']
-                a_end_mins = a['end_h'] * 60 + a['end_m']
-                b_start_mins = b['start_h'] * 60 + b['start_m']
-                b_end_mins = b['end_h'] * 60 + b['end_m']
-                # Convert to UTC offsets for comparison
-                a_offset = self.get_offset_at(a['zone'], now_utc) * 60
-                b_offset = self.get_offset_at(b['zone'], now_utc) * 60
-                a_utc_start = (a_start_mins - a_offset) % 1440
-                a_utc_end = (a_end_mins - a_offset) % 1440
-                b_utc_start = (b_start_mins - b_offset) % 1440
-                b_utc_end = (b_end_mins - b_offset) % 1440
-                # Simple overlap check (non-cross-midnight case)
-                def ranges_overlap(s1, e1, s2, e2):
-                    if s1 < e1 and s2 < e2:
-                        return max(s1, s2) < min(e1, e2)
-                    # Cross-midnight: expand to 0-2880 range
-                    def expand(s, e):
-                        if s <= e: return [(s, e)]
-                        return [(s, 1440), (0, e)]
-                    for r1 in expand(s1, e1):
-                        for r2 in expand(s2, e2):
-                            if max(r1[0], r2[0]) < min(r1[1], r2[1]):
-                                return True
-                    return False
-                if ranges_overlap(a_utc_start, a_utc_end, b_utc_start, b_utc_end):
+                # Build datetime ranges in UTC using a reference date
+                a_start_local = ref_date.replace(hour=a['start_h'], minute=a['start_m'])
+                a_end_local = ref_date.replace(hour=a['end_h'], minute=a['end_m'])
+                if a_end_local <= a_start_local:
+                    a_end_local += timedelta(days=1)
+                b_start_local = ref_date.replace(hour=b['start_h'], minute=b['start_m'])
+                b_end_local = ref_date.replace(hour=b['end_h'], minute=b['end_m'])
+                if b_end_local <= b_start_local:
+                    b_end_local += timedelta(days=1)
+                # Convert to UTC
+                a_utc_s = self.convert_zone_to_utc(a_start_local, a['zone'])
+                a_utc_e = self.convert_zone_to_utc(a_end_local, a['zone'])
+                b_utc_s = self.convert_zone_to_utc(b_start_local, b['zone'])
+                b_utc_e = self.convert_zone_to_utc(b_end_local, b['zone'])
+                # Overlap check: two intervals overlap if start_a < end_b AND start_b < end_a
+                if a_utc_s < b_utc_e and b_utc_s < a_utc_e:
                     day_names = {0:"Mon",1:"Tue",2:"Wed",3:"Thu",4:"Fri",5:"Sat",6:"Sun"}
                     shared_str = ",".join(day_names.get(int(d), d) for d in sorted(shared_days))
                     explanation = f"{a['zone']} {a['start_h']:02d}:{a['start_m']:02d}-{a['end_h']:02d}:{a['end_m']:02d} overlaps {b['zone']} {b['start_h']:02d}:{b['start_m']:02d}-{b['end_h']:02d}:{b['end_m']:02d} on {shared_str}"
@@ -423,12 +416,7 @@ class GawiApp:
                 pre_conflicts = self.detect_tz_blocks_conflicts()
                 # Simulate post-DST by checking conflicts (offsets will differ)
                 post_utc = transition + timedelta(hours=1)
-                post_conflicts = []
-                # Re-run conflict detection at post-DST time
-                orig_now = self.get_now_utc
-                self.get_now_utc = lambda: post_utc
-                post_conflicts = self.detect_tz_blocks_conflicts()
-                self.get_now_utc = orig_now
+                post_conflicts = self.detect_tz_blocks_conflicts(ref_utc=post_utc)
                 new_conflicts = [c for c in post_conflicts if c not in pre_conflicts]
                 if new_conflicts:
                     date_str = transition.strftime("%b %d")
@@ -1352,9 +1340,11 @@ class GawiApp:
             inner.pack(fill="x", padx=1, pady=1)
 
             # Convert block times to baseline zone for display
-            ref_date = now_utc.replace(hour=0, minute=0, second=0)
+            ref_date = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
             block_start_local = ref_date.replace(hour=block['start_h'], minute=block['start_m'])
             block_end_local = ref_date.replace(hour=block['end_h'], minute=block['end_m'])
+            if block_end_local <= block_start_local:
+                block_end_local += timedelta(days=1)
             start_utc = self.convert_zone_to_utc(block_start_local, block['zone'])
             end_utc = self.convert_zone_to_utc(block_end_local, block['zone'])
             start_baseline = self.convert_utc_to_zone(start_utc, baseline)
@@ -1469,6 +1459,18 @@ class GawiApp:
                            activebackground=self.colors["ACCENT"], activeforeground="white",
                            highlightthickness=0, bd=0, font=("Segoe UI", 9)).pack(side="left", padx=2)
 
+        # Error label (hidden by default)
+        error_label = tk.Label(self._block_editor_frame, text="", bg=self.colors["INPUT"],
+                               fg=self.colors["ERROR"], font=("Segoe UI", 8, "bold"))
+
+        def _show_editor_error(msg):
+            error_label.config(text=msg)
+            error_label.pack(fill="x", padx=10)
+            def _clear_error():
+                if error_label.winfo_exists():
+                    error_label.pack_forget()
+            self._block_editor_frame.after(3000, _clear_error)
+
         # Buttons (right-aligned)
         def _save_block():
             try:
@@ -1477,11 +1479,17 @@ class GawiApp:
                 e_h = int(var_end_h.get().strip())
                 e_m = int(var_end_m.get().strip())
                 if not (0 <= s_h <= 23 and 0 <= s_m <= 59 and 0 <= e_h <= 23 and 0 <= e_m <= 59):
+                    _show_editor_error("Invalid time — hours 0-23, minutes 0-59")
                     return
             except ValueError:
+                _show_editor_error("Invalid time — enter numbers only")
+                return
+            if s_h == e_h and s_m == e_m:
+                _show_editor_error("Start and end times cannot be the same")
                 return
             days = ','.join(str(i) for i in range(7) if block_day_vars[i].get() == 1)
             if not days:
+                _show_editor_error("Select at least one day")
                 return
             bd = {'zone': var_zone.get(), 'start_h': s_h, 'start_m': s_m, 'end_h': e_h, 'end_m': e_m, 'active_days': days}
             if block_id:

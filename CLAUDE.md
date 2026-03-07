@@ -457,6 +457,7 @@ Registry key for startup: `HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentV
 - [ ] 15-minute time tracking / time blindness tool (parked — needs design)
 - [ ] UI modernization (explore sv_ttk or custom themed widgets)
 - [ ] Anchor dates for Weekly/Monthly intervals (parked — needs design for day-of-week picker, day-of-month picker, TZ-aware anchoring)
+- [ ] Always-visible day checkboxes (parked — Days checkboxes are hidden behind "Use Active Hours" toggle, but day filtering is useful independently. E.g., a "Daily" reminder that only fires Sat/Sun/Mon for weekend habits. Consider separating day selection from hour restrictions so the feature is more discoverable.)
 - [x] Rename "Target Task" → "One-Time Task" in all UI strings
 
 ---
