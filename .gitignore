@@ -1,0 +1,40 @@
+# Database
+gawi.db
+
+# Lock/flag files
+gawi.lock
+wake.flag
+
+# PyInstaller build artifacts
+dist/
+build/
+*.spec
+
+# Python
+__pycache__/
+*.pyc
+
+# History backups
+History/
+
+# IDE
+.vscode/
+
+# Distribution bundle
+Gawi_Distribution/
+Gawi - Productivity Max/
+
+# Debug/diagnostic files
+compile_errors.bat
+debug.bat
+database fix.py
+diagnose database.py
+error_report.txt
+mark_done.log
+*.log
+
+# Screenshots/bug images
+bug big card.png
+
+# Claude Code local settings
+.claude/

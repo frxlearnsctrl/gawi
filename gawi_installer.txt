@@ -1,0 +1,26 @@
+========================================================================
+             GAWI - SCRIPT MODE RUN GUIDE
+========================================================================
+
+If you want to run Gawi as a Python script instead of a standalone .exe,
+follow these two simple steps:
+
+STEP 1: INSTALL DEPENDENCIES
+----------------------------
+Double-click "gawi_req_installer.bat".
+This will use Python to download and install the following:
+- pystray (for the system tray icon)
+- Pillow   (for dynamic icon generation)
+
+STEP 2: RUN THE APP
+-------------------
+Once the installer finishes, simply double-click "gawi.pyw".
+
+TECHNICAL REQUIREMENTS:
+- You must have Python 3.x installed on your Windows machine.
+- During Python installation, ensure "Add Python to PATH" was checked.
+
+NOTE ON DATA STORAGE:
+When running in script mode (.pyw), the application will create its
+database (gawi.db) in the SAME folder as the script.
+========================================================================
