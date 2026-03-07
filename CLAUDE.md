@@ -1,6 +1,6 @@
 # Gawi — CLAUDE.md
 
-> **Gawi** (Filipino: Habit / Custom / Way) — an aggressive accountability reminder tool for Windows. PHT-primary, ET-work dual-timezone, intrusive-by-design popups. Think Habitica meets a system utility.
+> **Gawi** (Filipino: Habit / Custom / Way) — an aggressive accountability reminder tool for Windows. Multi-timezone (ET, CT, MT, PT, PHT, JST, GMT) with configurable work/personal zone pair, intrusive-by-design popups. Think Habitica meets a system utility.
 
 ---
 
@@ -99,14 +99,19 @@ Detection: `getattr(sys, 'frozen', False)` — True when compiled with PyInstall
 self.get_now_utc()                          # → naive UTC datetime. USE THIS everywhere, never datetime.now()
 self.convert_utc_to_zone(utc_dt, "PHT")    # → PHT (UTC+8), always fixed
 self.convert_utc_to_zone(utc_dt, "ET")     # → ET (UTC-4 DST or UTC-5 standard), DST-aware
-self.convert_zone_to_utc(zone_dt, "PHT")   # → back to UTC from PHT
-self.convert_zone_to_utc(zone_dt, "ET")    # → back to UTC from ET (two-pass for DST boundary safety)
-self.get_et_offset_at(utc_dt)              # → -4 (DST) or -5 (standard), computed from UTC
+self.convert_utc_to_zone(utc_dt, "CT")     # → CT, MT, PT, JST, GMT also supported
+self.convert_zone_to_utc(zone_dt, "PHT")   # → back to UTC from any zone (two-pass for DST boundary safety)
+self.get_offset_at("ET", utc_dt)           # → generic offset lookup from TZ_REGISTRY; DST-aware for US zones
 ```
 
-### Timezone Labels
-- `"PHT"` — Philippines Time, UTC+8, no DST, fixed forever
-- `"ET"` — Eastern Time, UTC-4 (EDT) or UTC-5 (EST), DST computed dynamically
+### Timezone Labels (TZ_REGISTRY)
+- `"ET"` — Eastern Time, UTC-5/UTC-4 DST
+- `"CT"` — Central Time, UTC-6/UTC-5 DST
+- `"MT"` — Mountain Time, UTC-7/UTC-6 DST
+- `"PT"` — Pacific Time, UTC-8/UTC-7 DST
+- `"PHT"` — Philippines Time, UTC+8, no DST
+- `"JST"` — Japan Standard Time, UTC+9, no DST
+- `"GMT"` — GMT/UTC, offset 0, no DST
 - `"LOCAL"` — **DEPRECATED AND REMOVED.** Never reintroduce this.
 
 ### DB Storage Rule
@@ -216,11 +221,25 @@ CREATE TABLE settings (
     tz_paused INTEGER DEFAULT 0,
     window_x INTEGER DEFAULT NULL,   -- NULL = first launch → center on primary monitor
     window_y INTEGER DEFAULT NULL,   -- Saved on hide/quit, restored on startup
-    work_days TEXT DEFAULT '0,1,2,3,4'  -- Comma-separated weekday ints (0=Mon), configurable
+    work_days TEXT DEFAULT '0,1,2,3,4',  -- Comma-separated weekday ints (0=Mon), configurable
+    work_zone TEXT DEFAULT 'ET',     -- TZ label for work hours (legacy, used for auto-migration)
+    personal_zone TEXT DEFAULT 'PHT', -- TZ label for personal hours (key into TZ_REGISTRY)
+    baseline_display_zone TEXT DEFAULT 'ET' -- TZ for displaying block times in comparison view
+);
+
+CREATE TABLE tz_blocks (
+    id INTEGER PRIMARY KEY,
+    zone TEXT NOT NULL,              -- TZ label from TZ_REGISTRY (e.g., "ET", "PT")
+    start_h INTEGER NOT NULL,       -- 0-23 (in the block's own zone)
+    start_m INTEGER NOT NULL,       -- 0-59
+    end_h INTEGER NOT NULL,         -- 0-23
+    end_m INTEGER NOT NULL,         -- 0-59
+    active_days TEXT NOT NULL DEFAULT '0,1,2,3,4',  -- CSV weekday ints (0=Mon)
+    sort_order INTEGER DEFAULT 0    -- First-match-wins priority (lower = higher priority)
 );
 ```
 
-**Migration pattern:** `init_db()` uses `ALTER TABLE ADD COLUMN IF NOT EXISTS` style migrations via PRAGMA + loop. Always add new columns here — never recreate the table.
+**Migration pattern:** `init_db()` uses `ALTER TABLE ADD COLUMN IF NOT EXISTS` style migrations via PRAGMA + loop. Always add new columns here — never recreate the table. On first load, if `tz_blocks` is empty, auto-creates one block from existing `work_zone`/`work_start_h`/`work_end_h` settings.
 
 ---
 
@@ -261,35 +280,43 @@ ACTION BUTTONS (right-aligned):
 
 ---
 
-## Timezone Switcher (The Second App — Now Integrated)
+## Timezone Switcher (Multi-Zone Time Blocks)
 
-Automatically switches the Windows system timezone between ET (work) and PHT (personal) based on a configurable work hours schedule.
+Automatically switches the Windows system timezone between work zone blocks and a personal zone. Supports multiple work blocks (e.g., ET 9-12 + PT 1-5) with first-match-wins priority.
 
 ### Key Functions
 
 ```python
 get_current_timezone()          # PowerShell Get-TimeZone — returns Windows TZ ID string
 set_timezone(timezone_id)       # PowerShell Set-TimeZone — runs async on daemon thread
-check_and_switch_timezone(now_utc)  # Called in check_loop every 60s; decides ET vs PHT
-should_be_in_et(et_time, work_start, work_end)  # Returns True during configured work days/hours
-quick_toggle_tz()               # Tray menu: manual flip between ET and PHT
+find_active_tz_block(now_utc)   # Returns TZ label of first matching work block, or personal zone
+check_and_switch_timezone(now_utc)  # Called in check_loop every 60s; uses find_active_tz_block()
+get_minutes_until_next_switch() # Scans forward minute-by-minute to find next zone change
+quick_toggle_tz()               # Tray menu: toggle between current block zone and personal zone
 toggle_tz_pause()               # Tray menu + UI: suspends automation, saves to settings DB
 update_header()                 # Reads cached TZ state, updates header label, re-schedules itself
+load_tz_blocks()                # Query tz_blocks table, populate self.tz_blocks cache
+save_tz_block(block_dict)       # INSERT or UPDATE a block, reload cache
+delete_tz_block(block_id)       # DELETE a block, rebuild sort_order
+reorder_tz_blocks(block_id, direction)  # Swap sort_order with adjacent block
+detect_tz_blocks_conflicts()    # Pairwise UTC overlap detection, returns (id_a, id_b, explanation)
+get_dst_warning_if_needed(now_utc)  # Warns 7 days before DST if new conflicts would appear
+_get_personal_zone()            # Read from settings var, fallback "PHT"
 ```
 
 ### Tray Icon States
 
 | State | Color | Shape |
 |-------|-------|-------|
-| ET (Work Mode) | Green | Battery bars (hours until end-of-work) |
-| PHT (Personal Mode) | Blue | Battery bars (hours until work start) |
+| Any work block active | Green | Battery bars (minutes until next switch) |
+| Personal zone (no block) | Blue | Battery bars (minutes until next switch) |
 | Paused | Gray | Battery bars |
 | < 60 min to switch | Any | Countdown number |
 | Active popups | Any | + Red badge (top-right) |
 
 ### Settings Persistence
 
-Work hours and work days stored in `settings` table (id=1). Loaded at startup via `load_global_settings()`. Saved via `save_global_settings()` (async background thread). Work days are configurable via day checkboxes (M T W T F S S) — defaults to Mon-Fri.
+Personal zone and baseline display zone stored in `settings` table (id=1). Work blocks stored in `tz_blocks` table (zone, start/end, days, sort_order). Loaded at startup via `load_global_settings()` + `load_tz_blocks()`. Blocks saved individually via `save_tz_block()`. Auto-migration on first load creates one block from legacy `work_zone`/`work_start_h`/`work_end_h` settings.
 
 ---
 
@@ -307,10 +334,10 @@ Palette is stored in `self.colors`. All widgets reference `self.colors["KEY"]`. 
 ## Configuration Constants
 
 ```python
-APP_ID = 'Gawi.Pro.v9.9'
+APP_ID = 'Gawi.Pro.v9.9.4'
 CHECK_INTERVAL = 5          # seconds between check_loop iterations
-EASTERN_TZ_ID = "Eastern Standard Time"   # Windows TZ ID for ET
-PHT_TZ_ID = "Singapore Standard Time"     # Windows TZ ID for PHT (same UTC offset)
+TZ_REGISTRY = {...}         # Dict of 7 zones: ET, CT, MT, PT, PHT, JST, GMT — each with windows_id, base_offset, has_dst, dst_offset
+TZ_LABELS = sorted(TZ_REGISTRY.keys())  # Alphabetically sorted list for UI dropdowns
 ```
 
 Registry key for startup: `HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run\Gawi`
@@ -425,7 +452,8 @@ Registry key for startup: `HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentV
 - [x] Interval presets dropdown (15m–Monthly + custom input)
 - [ ] Context presets (Deep Work / Admin modes)
 - [ ] Snooze friction — free first snooze, confirmation on 2nd+, emergency 15m always available (ADHD-friendly)
-- [ ] More timezone support beyond ET/PHT
+- [x] More timezone support beyond ET/PHT (TZ_REGISTRY: ET, CT, MT, PT, PHT, JST, GMT)
+- [x] Multi-zone time blocks (v9.9.4 — `tz_blocks` table, first-match-wins priority, ▲▼ reorder, conflict detection, baseline display zone, DST warnings, cross-midnight support)
 - [ ] 15-minute time tracking / time blindness tool (parked — needs design)
 - [ ] UI modernization (explore sv_ttk or custom themed widgets)
 - [ ] Anchor dates for Weekly/Monthly intervals (parked — needs design for day-of-week picker, day-of-month picker, TZ-aware anchoring)
@@ -435,7 +463,38 @@ Registry key for startup: `HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentV
 
 ## Version History
 
-### v9.9.2 (Current)
+### v9.9.4 (Current)
+- **Multi-Zone Time Blocks**
+- New `tz_blocks` table: zone, start/end hours, active days, sort_order — supports unlimited work blocks
+- `find_active_tz_block()` replaces `should_be_in_work_zone()` — first-match-wins priority for multiple overlapping blocks
+- `detect_tz_blocks_conflicts()` — pairwise UTC overlap detection with cross-midnight support
+- `get_dst_warning_if_needed()` — warns 7 days before DST transition if new conflicts would appear
+- Baseline display zone dropdown — converts all block times to a chosen TZ for side-by-side comparison
+- Block table UI with ▲▼ reorder, inline editor (zone/start/end/days), delete, conflict markers (⚠/✓)
+- `get_minutes_until_next_switch()` rewritten — scans forward minute-by-minute for multi-block awareness
+- Tray icon: green = any work block active, blue = personal zone, unchanged countdown/badge logic
+- Auto-migration: on first load, existing `work_zone`/`work_start`/`work_end` settings become first block
+- `check_and_switch_timezone()` simplified — uses `find_active_tz_block()` directly
+- `quick_toggle_tz()` — toggles between current block zone and personal zone
+- Cross-midnight blocks supported (e.g., 22:00-06:00)
+- `baseline_display_zone` column added to settings table
+- Old `work_zone`/`work_start_h`/`work_end_h` columns preserved for backward compatibility
+
+### v9.9.3
+- **Timezone Expansion — Named TZ Registry**
+- `TZ_REGISTRY` dict with 7 timezones: ET, CT, MT, PT, PHT, JST, GMT — each with Windows ID, base offset, DST flag, and DST offset
+- Generic `get_offset_at(tz_label, utc_time)` replaces `get_et_offset_at()` + `get_pht_offset()` — all US zones share DST date logic with zone-specific offsets
+- `convert_utc_to_zone()` / `convert_zone_to_utc()` now fully generic (work with any registry key)
+- TZ Switcher configurable: `work_zone` / `personal_zone` columns in settings DB, dropdown selectors in UI
+- `should_be_in_et()` → `should_be_in_work_zone()` — uses configured work zone instead of hardcoded ET
+- Tray icon: green = work zone (any), blue = personal zone (any) — color represents mode, not specific TZ
+- All TZ dropdowns (reminder, pattern, one-time task) expanded from 2 options to 7
+- One-Time Task: radio buttons replaced with Combobox for 7-zone support
+- `_tz_label_from_windows_id()` reverse lookup for display logic
+- Header shows dynamic zone label (e.g., "CT (Work Mode)" instead of hardcoded "ET (Work Mode)")
+- Old `EASTERN_TZ_ID` / `PHT_TZ_ID` constants removed — all lookups go through `TZ_REGISTRY`
+
+### v9.9.2
 - **Interval Presets + One-Time Task Rename**
 - Interval input replaced with `ttk.Combobox` dropdown: 15m, 30m, 1h, 2h, 4h, 8h, 12h, Daily, Weekly, Monthly — users can also type custom values
 - `_format_interval()` / `_parse_interval()` helpers convert between int minutes and display strings

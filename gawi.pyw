@@ -19,11 +19,19 @@ import winreg
 # --- CONFIGURATION ---
 ICON_FILE = 'icon2.png'
 CHECK_INTERVAL = 5
-APP_ID = 'Gawi.Pro.v9.9.2'
+APP_ID = 'Gawi.Pro.v9.9.4'
 
-# Timezone IDs for Windows PowerShell
-EASTERN_TZ_ID = "Eastern Standard Time"
-PHT_TZ_ID = "Singapore Standard Time"
+# Timezone Registry — all supported timezones
+TZ_REGISTRY = {
+    "ET":  {"display": "Eastern",     "windows_id": "Eastern Standard Time",  "base_offset": -5, "has_dst": True,  "dst_offset": -4},
+    "CT":  {"display": "Central",     "windows_id": "Central Standard Time",  "base_offset": -6, "has_dst": True,  "dst_offset": -5},
+    "MT":  {"display": "Mountain",    "windows_id": "Mountain Standard Time", "base_offset": -7, "has_dst": True,  "dst_offset": -6},
+    "PT":  {"display": "Pacific",     "windows_id": "Pacific Standard Time",  "base_offset": -8, "has_dst": True,  "dst_offset": -7},
+    "PHT": {"display": "Philippines", "windows_id": "Singapore Standard Time","base_offset": 8,  "has_dst": False, "dst_offset": 8},
+    "JST": {"display": "Japan",       "windows_id": "Tokyo Standard Time",    "base_offset": 9,  "has_dst": False, "dst_offset": 9},
+    "GMT": {"display": "GMT/UTC",     "windows_id": "GMT Standard Time",      "base_offset": 0,  "has_dst": False, "dst_offset": 0},
+}
+TZ_LABELS = sorted(TZ_REGISTRY.keys())
 
 # --- PATH RESOLUTION ---
 if getattr(sys, 'frozen', False):
@@ -170,7 +178,7 @@ class GawiApp:
         self.active_popups = set()
         self.last_trigger_minute = {}
         self.cached_tz = None
-        self._saved_work_hours = (7, 0, 17, 0)
+        self._saved_work_hours = (7, 0, 17, 0, '0,1,2,3,4', 'ET', 'PHT', 'ET')
         self._window_x = None
         self._window_y = None
         self.icon = None
@@ -230,6 +238,13 @@ class GawiApp:
         self.var_work_end_m = tk.StringVar(value="00")
         self.var_tz_paused = tk.IntVar(value=0)
         self.var_work_days = [tk.IntVar(value=1 if i <= 4 else 0) for i in range(7)]  # Mon-Fri default
+        self.var_work_zone = tk.StringVar(value="ET")
+        self.var_personal_zone = tk.StringVar(value="PHT")
+        self.var_baseline_display_zone = tk.StringVar(value="ET")
+        self.tz_blocks = []
+        self.selected_block_id = None
+        self._dst_warning_dismissed = False
+        self._block_widgets = {}
 
     # --- TIMEZONE SWITCHER LOGIC ---
 
@@ -238,6 +253,194 @@ class GawiApp:
 
     def _get_work_days_set(self):
         return set(i for i in range(7) if self.var_work_days[i].get() == 1)
+
+    def _get_work_zone(self):
+        return self.var_work_zone.get() or "ET"
+
+    def _get_personal_zone(self):
+        return self.var_personal_zone.get() or "PHT"
+
+    def load_tz_blocks(self):
+        try:
+            conn = sqlite3.connect(DB_FILE)
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            c.execute("SELECT * FROM tz_blocks ORDER BY sort_order")
+            self.tz_blocks = [dict(row) for row in c.fetchall()]
+            conn.close()
+        except Exception as e:
+            print(f"Error loading tz_blocks: {e}")
+            self.tz_blocks = []
+
+    def save_tz_block(self, block_dict):
+        try:
+            conn = sqlite3.connect(DB_FILE)
+            c = conn.cursor()
+            if block_dict.get('id'):
+                c.execute("""UPDATE tz_blocks SET zone=?, start_h=?, start_m=?, end_h=?, end_m=?, active_days=?
+                             WHERE id=?""",
+                          (block_dict['zone'], block_dict['start_h'], block_dict['start_m'],
+                           block_dict['end_h'], block_dict['end_m'], block_dict['active_days'], block_dict['id']))
+            else:
+                max_order = 0
+                c.execute("SELECT MAX(sort_order) FROM tz_blocks")
+                row = c.fetchone()
+                if row and row[0] is not None:
+                    max_order = row[0] + 1
+                c.execute("""INSERT INTO tz_blocks (zone, start_h, start_m, end_h, end_m, active_days, sort_order)
+                             VALUES (?,?,?,?,?,?,?)""",
+                          (block_dict['zone'], block_dict['start_h'], block_dict['start_m'],
+                           block_dict['end_h'], block_dict['end_m'], block_dict['active_days'], max_order))
+            conn.commit()
+            conn.close()
+            self.load_tz_blocks()
+            self.gui_queue.put(('REFRESH_TZ_BLOCKS_UI',))
+        except Exception as e:
+            print(f"Error saving tz_block: {e}")
+
+    def delete_tz_block(self, block_id):
+        try:
+            conn = sqlite3.connect(DB_FILE)
+            c = conn.cursor()
+            c.execute("DELETE FROM tz_blocks WHERE id=?", (block_id,))
+            # Rebuild sort_order
+            c.execute("SELECT id FROM tz_blocks ORDER BY sort_order")
+            for i, row in enumerate(c.fetchall()):
+                c.execute("UPDATE tz_blocks SET sort_order=? WHERE id=?", (i, row[0]))
+            conn.commit()
+            conn.close()
+            self.load_tz_blocks()
+            self.gui_queue.put(('REFRESH_TZ_BLOCKS_UI',))
+        except Exception as e:
+            print(f"Error deleting tz_block: {e}")
+
+    def reorder_tz_blocks(self, block_id, direction):
+        idx = None
+        for i, b in enumerate(self.tz_blocks):
+            if b['id'] == block_id:
+                idx = i
+                break
+        if idx is None:
+            return
+        swap_idx = idx - 1 if direction == "up" else idx + 1
+        if swap_idx < 0 or swap_idx >= len(self.tz_blocks):
+            return
+        try:
+            conn = sqlite3.connect(DB_FILE)
+            c = conn.cursor()
+            id_a, order_a = self.tz_blocks[idx]['id'], self.tz_blocks[idx]['sort_order']
+            id_b, order_b = self.tz_blocks[swap_idx]['id'], self.tz_blocks[swap_idx]['sort_order']
+            c.execute("UPDATE tz_blocks SET sort_order=? WHERE id=?", (order_b, id_a))
+            c.execute("UPDATE tz_blocks SET sort_order=? WHERE id=?", (order_a, id_b))
+            conn.commit()
+            conn.close()
+            self.load_tz_blocks()
+            self.gui_queue.put(('REFRESH_TZ_BLOCKS_UI',))
+        except Exception as e:
+            print(f"Error reordering tz_blocks: {e}")
+
+    def find_active_tz_block(self, now_utc):
+        for block in sorted(self.tz_blocks, key=lambda b: b['sort_order']):
+            zone_time = self.convert_utc_to_zone(now_utc, block['zone'])
+            weekday = zone_time.weekday()
+            if str(weekday) not in block['active_days'].split(','):
+                continue
+            now_mins = zone_time.hour * 60 + zone_time.minute
+            start_mins = block['start_h'] * 60 + block['start_m']
+            end_mins = block['end_h'] * 60 + block['end_m']
+            if start_mins <= end_mins:
+                if start_mins <= now_mins < end_mins:
+                    return block['zone']
+            else:
+                if now_mins >= start_mins or now_mins < end_mins:
+                    return block['zone']
+        return self._get_personal_zone()
+
+    def detect_tz_blocks_conflicts(self):
+        conflicts = []
+        blocks = sorted(self.tz_blocks, key=lambda b: b['sort_order'])
+        for i in range(len(blocks)):
+            for j in range(i + 1, len(blocks)):
+                a, b = blocks[i], blocks[j]
+                days_a = set(a['active_days'].split(','))
+                days_b = set(b['active_days'].split(','))
+                shared_days = days_a & days_b
+                if not shared_days:
+                    continue
+                # Convert both to UTC minute ranges for a reference day
+                now_utc = self.get_now_utc()
+                a_start_mins = a['start_h'] * 60 + a['start_m']
+                a_end_mins = a['end_h'] * 60 + a['end_m']
+                b_start_mins = b['start_h'] * 60 + b['start_m']
+                b_end_mins = b['end_h'] * 60 + b['end_m']
+                # Convert to UTC offsets for comparison
+                a_offset = self.get_offset_at(a['zone'], now_utc) * 60
+                b_offset = self.get_offset_at(b['zone'], now_utc) * 60
+                a_utc_start = (a_start_mins - a_offset) % 1440
+                a_utc_end = (a_end_mins - a_offset) % 1440
+                b_utc_start = (b_start_mins - b_offset) % 1440
+                b_utc_end = (b_end_mins - b_offset) % 1440
+                # Simple overlap check (non-cross-midnight case)
+                def ranges_overlap(s1, e1, s2, e2):
+                    if s1 < e1 and s2 < e2:
+                        return max(s1, s2) < min(e1, e2)
+                    # Cross-midnight: expand to 0-2880 range
+                    def expand(s, e):
+                        if s <= e: return [(s, e)]
+                        return [(s, 1440), (0, e)]
+                    for r1 in expand(s1, e1):
+                        for r2 in expand(s2, e2):
+                            if max(r1[0], r2[0]) < min(r1[1], r2[1]):
+                                return True
+                    return False
+                if ranges_overlap(a_utc_start, a_utc_end, b_utc_start, b_utc_end):
+                    day_names = {0:"Mon",1:"Tue",2:"Wed",3:"Thu",4:"Fri",5:"Sat",6:"Sun"}
+                    shared_str = ",".join(day_names.get(int(d), d) for d in sorted(shared_days))
+                    explanation = f"{a['zone']} {a['start_h']:02d}:{a['start_m']:02d}-{a['end_h']:02d}:{a['end_m']:02d} overlaps {b['zone']} {b['start_h']:02d}:{b['start_m']:02d}-{b['end_h']:02d}:{b['end_m']:02d} on {shared_str}"
+                    conflicts.append((a['id'], b['id'], explanation))
+        return conflicts
+
+    def get_dst_warning_if_needed(self, now_utc):
+        # Check if any DST transition is within 7 days for zones used in blocks
+        dst_zones = set()
+        for block in self.tz_blocks:
+            cfg = TZ_REGISTRY.get(block['zone'])
+            if cfg and cfg['has_dst']:
+                dst_zones.add(block['zone'])
+        if not dst_zones:
+            return None
+        year = now_utc.year
+        march_1st = datetime(year, 3, 1)
+        days_to_2nd_sun = (6 - march_1st.weekday() + 7) % 7 + 7
+        dst_start = march_1st + timedelta(days=days_to_2nd_sun, hours=2)
+        nov_1st = datetime(year, 11, 1)
+        days_to_1st_sun = (6 - nov_1st.weekday() + 7) % 7
+        dst_end = nov_1st + timedelta(days=days_to_1st_sun, hours=2)
+        for transition in [dst_start, dst_end]:
+            days_until = (transition - now_utc).total_seconds() / 86400
+            if 0 < days_until <= 7:
+                # Check if conflicts change after transition
+                pre_conflicts = self.detect_tz_blocks_conflicts()
+                # Simulate post-DST by checking conflicts (offsets will differ)
+                post_utc = transition + timedelta(hours=1)
+                post_conflicts = []
+                # Re-run conflict detection at post-DST time
+                orig_now = self.get_now_utc
+                self.get_now_utc = lambda: post_utc
+                post_conflicts = self.detect_tz_blocks_conflicts()
+                self.get_now_utc = orig_now
+                new_conflicts = [c for c in post_conflicts if c not in pre_conflicts]
+                if new_conflicts:
+                    date_str = transition.strftime("%b %d")
+                    warnings = "; ".join(c[2] for c in new_conflicts[:2])
+                    return f"DST change on {date_str}: {warnings}. Adjust blocks to avoid conflict."
+        return None
+
+    def _tz_label_from_windows_id(self, windows_id):
+        for label, cfg in TZ_REGISTRY.items():
+            if cfg["windows_id"] == windows_id:
+                return label
+        return self._get_work_zone()
 
     def get_current_timezone(self):
         try:
@@ -276,60 +479,36 @@ class GawiApp:
 
         threading.Thread(target=_set_tz, daemon=True).start()
 
-    def should_be_in_et(self, et_time, work_start, work_end):
-        weekday = et_time.weekday()
-        current_minutes = et_time.hour * 60 + et_time.minute
-        work_days = self._get_work_days_set()
-
-        if weekday in work_days:
-            if work_start <= current_minutes < work_end:
-                return True
-        return False
-
-    def get_minutes_until_next_switch(self, now_et, work_start, work_end):
-        current_mins = now_et.hour * 60 + now_et.minute
-        weekday = now_et.weekday()  # 0=Mon … 6=Sun
-        work_days = self._get_work_days_set()
-        if self.should_be_in_et(now_et, work_start, work_end):
-            return max(0, work_end - current_mins)
-        # Work day before work starts
-        if weekday in work_days and current_mins < work_start:
-            return work_start - current_mins
-        # After work or non-work day — count remaining today + days to next work day
-        remaining_today = 1440 - current_mins
-        days_ahead = 1
-        test_day = (weekday + 1) % 7
-        while days_ahead <= 7:
-            if test_day in work_days:
-                return remaining_today + (days_ahead - 1) * 1440 + work_start
-            days_ahead += 1
-            test_day = (test_day + 1) % 7
-        return 1440  # safety fallback
+    def get_minutes_until_next_switch(self):
+        now_utc = self.get_now_utc()
+        current_zone = self.find_active_tz_block(now_utc)
+        for m in range(1, 1441):
+            future_utc = now_utc + timedelta(minutes=m)
+            if self.find_active_tz_block(future_utc) != current_zone:
+                return m
+        return 1440
 
     def check_and_switch_timezone(self, now_utc):
         if self.var_tz_paused.get() == 1:
             return
-
-        now_et = self.convert_utc_to_zone(now_utc, "ET")
-        work_start = int(self.var_work_start_h.get()) * 60 + int(self.var_work_start_m.get())
-        work_end = int(self.var_work_end_h.get()) * 60 + int(self.var_work_end_m.get())
-
-        should_be_et = self.should_be_in_et(now_et, work_start, work_end)
+        target_zone = self.find_active_tz_block(now_utc)
+        target_tz_id = TZ_REGISTRY[target_zone]["windows_id"]
         current_tz = self.cached_tz or self.get_current_timezone()
-
-        if should_be_et:
-            if current_tz != EASTERN_TZ_ID:
-                self.set_timezone(EASTERN_TZ_ID)
-        else:
-            if current_tz != PHT_TZ_ID:
-                self.set_timezone(PHT_TZ_ID)
+        if current_tz != target_tz_id:
+            self.set_timezone(target_tz_id)
 
     def quick_toggle_tz(self, icon=None, item=None):
+        personal_zone_id = TZ_REGISTRY[self._get_personal_zone()]["windows_id"]
         current_tz = self.cached_tz or self.get_current_timezone()
-        if current_tz and current_tz == EASTERN_TZ_ID:
-            self.set_timezone(PHT_TZ_ID)
+        if current_tz and current_tz != personal_zone_id:
+            self.set_timezone(personal_zone_id)
         else:
-            self.set_timezone(EASTERN_TZ_ID)
+            # Switch to first block's zone, or work zone fallback
+            if self.tz_blocks:
+                first_zone = self.tz_blocks[0]['zone']
+            else:
+                first_zone = self._get_work_zone()
+            self.set_timezone(TZ_REGISTRY[first_zone]["windows_id"])
 
     def toggle_tz_pause(self, icon=None, item=None):
         current = self.var_tz_paused.get()
@@ -345,27 +524,18 @@ class GawiApp:
         dc = ImageDraw.Draw(image)
 
         paused = self.var_tz_paused.get() == 1
-        current_tz = self.cached_tz or self.get_current_timezone()
+        now_utc = self.get_now_utc()
+        active_zone = self.find_active_tz_block(now_utc)
+        personal_zone = self._get_personal_zone()
 
         if paused:
             color = (128, 128, 128)
-        elif current_tz and current_tz == EASTERN_TZ_ID:
-            color = (152, 251, 152) 
+        elif active_zone != personal_zone:
+            color = (152, 251, 152)  # Green = work block active
         else:
-            color = (0, 191, 255) 
+            color = (0, 191, 255)    # Blue = personal zone
 
-        now_utc = self.get_now_utc()
-        now_et = self.convert_utc_to_zone(now_utc, "ET")
-        current_mins = now_et.hour * 60 + now_et.minute
-        
-        try:
-            work_start = int(self.var_work_start_h.get()) * 60 + int(self.var_work_start_m.get())
-            work_end = int(self.var_work_end_h.get()) * 60 + int(self.var_work_end_m.get())
-        except:
-            work_start = 7 * 60
-            work_end = 17 * 60
-
-        minutes_until = self.get_minutes_until_next_switch(now_et, work_start, work_end)
+        minutes_until = self.get_minutes_until_next_switch()
 
         if minutes_until > 60:
             max_hours = 8
@@ -422,7 +592,13 @@ class GawiApp:
     def get_now_zone(self, tz_label):
         return self.convert_utc_to_zone(self.get_now_utc(), tz_label)
 
-    def get_et_offset_at(self, utc_time):
+    def get_offset_at(self, tz_label, utc_time):
+        cfg = TZ_REGISTRY.get(tz_label)
+        if not cfg:
+            return 0
+        if not cfg["has_dst"]:
+            return cfg["base_offset"]
+        # US DST: 2nd Sunday March 2:00 UTC → 1st Sunday November 2:00 UTC
         year = utc_time.year
         march_1st = datetime(year, 3, 1)
         days_to_2nd_sun = (6 - march_1st.weekday() + 7) % 7 + 7
@@ -432,29 +608,20 @@ class GawiApp:
         days_to_1st_sun = (6 - nov_1st.weekday() + 7) % 7
         dst_end = nov_1st + timedelta(days=days_to_1st_sun)
         dst_end = dst_end.replace(hour=2)
-        
         if dst_start <= utc_time < dst_end:
-            return -4
+            return cfg["dst_offset"]
         else:
-            return -5
-
-    def get_pht_offset(self):
-        return 8
+            return cfg["base_offset"]
 
     def convert_utc_to_zone(self, utc_time, tz_label):
-        if tz_label == "PHT":
-            return utc_time + timedelta(hours=8)
-        else:
-            return utc_time + timedelta(hours=self.get_et_offset_at(utc_time))
+        offset = self.get_offset_at(tz_label, utc_time)
+        return utc_time + timedelta(hours=offset)
 
     def convert_zone_to_utc(self, zone_time, tz_label):
-        if tz_label == "PHT":
-            return zone_time - timedelta(hours=8)
-        else:
-            offset = self.get_et_offset_at(zone_time)
-            utc_guess = zone_time - timedelta(hours=offset)
-            actual_offset = self.get_et_offset_at(utc_guess)
-            return zone_time - timedelta(hours=actual_offset)
+        offset = self.get_offset_at(tz_label, zone_time)
+        utc_guess = zone_time - timedelta(hours=offset)
+        actual_offset = self.get_offset_at(tz_label, utc_guess)
+        return zone_time - timedelta(hours=actual_offset)
 
     def is_time_valid(self, check_time_utc, use_hours, s_h, s_m, e_h, e_m, days_str, tz_label="ET"):
         zone_time = self.convert_utc_to_zone(check_time_utc, tz_label)
@@ -732,10 +899,29 @@ class GawiApp:
 
         c.execute("PRAGMA table_info(settings)")
         settings_cols = [info[1] for info in c.fetchall()]
-        for col, dtype in [('window_x', 'INTEGER DEFAULT NULL'), ('window_y', 'INTEGER DEFAULT NULL'), ('work_days', "TEXT DEFAULT '0,1,2,3,4'")]:
+        for col, dtype in [('window_x', 'INTEGER DEFAULT NULL'), ('window_y', 'INTEGER DEFAULT NULL'), ('work_days', "TEXT DEFAULT '0,1,2,3,4'"), ('work_zone', "TEXT DEFAULT 'ET'"), ('personal_zone', "TEXT DEFAULT 'PHT'"), ('baseline_display_zone', "TEXT DEFAULT 'ET'")]:
             if col not in settings_cols:
                 try: c.execute(f"ALTER TABLE settings ADD COLUMN {col} {dtype}")
                 except: pass
+
+        c.execute('''CREATE TABLE IF NOT EXISTS tz_blocks
+                     (id INTEGER PRIMARY KEY,
+                      zone TEXT NOT NULL,
+                      start_h INTEGER NOT NULL,
+                      start_m INTEGER NOT NULL,
+                      end_h INTEGER NOT NULL,
+                      end_m INTEGER NOT NULL,
+                      active_days TEXT NOT NULL DEFAULT '0,1,2,3,4',
+                      sort_order INTEGER DEFAULT 0)''')
+
+        # Auto-migrate: if tz_blocks is empty and old work settings exist, create one block
+        c.execute("SELECT count(*) FROM tz_blocks")
+        if c.fetchone()[0] == 0:
+            c.execute("SELECT work_zone, work_start_h, work_start_m, work_end_h, work_end_m, work_days FROM settings WHERE id=1")
+            srow = c.fetchone()
+            if srow and srow[0]:
+                c.execute("INSERT INTO tz_blocks (zone, start_h, start_m, end_h, end_m, active_days, sort_order) VALUES (?,?,?,?,?,?,0)",
+                          (srow[0], srow[1] or 7, srow[2] or 0, srow[3] or 17, srow[4] or 0, srow[5] or '0,1,2,3,4'))
 
         conn.commit()
         conn.close()
@@ -760,8 +946,15 @@ class GawiApp:
                     wd_set = set(d for d in (int(x) for x in work_days_str.split(',') if x.strip().isdigit()) if 0 <= d <= 6)
                     for i in range(7):
                         self.var_work_days[i].set(1 if i in wd_set else 0)
+                if 'work_zone' in row.keys() and row['work_zone']:
+                    self.var_work_zone.set(row['work_zone'])
+                if 'personal_zone' in row.keys() and row['personal_zone']:
+                    self.var_personal_zone.set(row['personal_zone'])
+                if 'baseline_display_zone' in row.keys() and row['baseline_display_zone']:
+                    self.var_baseline_display_zone.set(row['baseline_display_zone'])
             conn.close()
-            self._saved_work_hours = (int(self.var_work_start_h.get()), int(self.var_work_start_m.get()), int(self.var_work_end_h.get()), int(self.var_work_end_m.get()), self._get_work_days_str())
+            self.load_tz_blocks()
+            self._saved_work_hours = (int(self.var_work_start_h.get()), int(self.var_work_start_m.get()), int(self.var_work_end_h.get()), int(self.var_work_end_m.get()), self._get_work_days_str(), self.var_work_zone.get(), self.var_personal_zone.get(), self.var_baseline_display_zone.get())
         except:
             pass
 
@@ -839,22 +1032,25 @@ class GawiApp:
                 return
 
             work_days_str = self._get_work_days_str()
+            work_zone = self.var_work_zone.get()
+            personal_zone = self.var_personal_zone.get()
+            baseline_display_zone = self.var_baseline_display_zone.get()
 
             def worker():
                 try:
                     conn = sqlite3.connect(DB_FILE)
                     c = conn.cursor()
                     c.execute("""UPDATE settings SET
-                                 work_start_h=?, work_start_m=?, work_end_h=?, work_end_m=?, tz_paused=?, work_days=?
+                                 work_start_h=?, work_start_m=?, work_end_h=?, work_end_m=?, tz_paused=?, work_days=?, work_zone=?, personal_zone=?, baseline_display_zone=?
                                  WHERE id=1""",
-                              (w_s_h, w_s_m, w_e_h, w_e_m, self.var_tz_paused.get(), work_days_str))
+                              (w_s_h, w_s_m, w_e_h, w_e_m, self.var_tz_paused.get(), work_days_str, work_zone, personal_zone, baseline_display_zone))
                     conn.commit()
                     conn.close()
                     self.gui_queue.put(('SAVE_FEEDBACK',))
                 except:
                     pass
 
-            self._saved_work_hours = (int(self.var_work_start_h.get()), int(self.var_work_start_m.get()), int(self.var_work_end_h.get()), int(self.var_work_end_m.get()), self._get_work_days_str())
+            self._saved_work_hours = (int(self.var_work_start_h.get()), int(self.var_work_start_m.get()), int(self.var_work_end_h.get()), int(self.var_work_end_m.get()), self._get_work_days_str(), work_zone, personal_zone, baseline_display_zone)
             threading.Thread(target=worker, daemon=True).start()
             self.gui_queue.put(('UPDATE_ICON',))
             self.next_tz_check = self.get_now_utc()
@@ -962,10 +1158,14 @@ class GawiApp:
         try:
             if self.cached_tz is None:
                 self.cached_tz = self.get_current_timezone()
-            if self.cached_tz and self.cached_tz == EASTERN_TZ_ID:
-                mode_str = "ET (Work Mode)"
+            tz_label = self._tz_label_from_windows_id(self.cached_tz) if self.cached_tz else self._get_personal_zone()
+            now_utc = self.get_now_utc()
+            active_zone = self.find_active_tz_block(now_utc)
+            personal_zone = self._get_personal_zone()
+            if active_zone != personal_zone:
+                mode_str = f"{tz_label} (Work Mode)"
             else:
-                mode_str = "PHT (Personal Mode)"
+                mode_str = f"{tz_label} (Personal Mode)"
 
             self.lbl_header_mode.config(text=f"{mode_str}")
         except:
@@ -1041,55 +1241,57 @@ class GawiApp:
                   relief="flat", padx=10).pack(side="right", padx=(0, 10))
 
         # --- GLOBAL SETTINGS ---
-        settings_frame = tk.LabelFrame(self.root, text="  Timezone Switcher  ", 
-                                        bg=self.colors["BG"], fg=self.colors["ACCENT"], 
+        settings_frame = tk.LabelFrame(self.root, text="  Time Zone Blocks  ",
+                                        bg=self.colors["BG"], fg=self.colors["ACCENT"],
                                         font=("Segoe UI", 11, "bold"), relief="flat", bd=2)
         settings_frame.pack(fill="x", padx=20, pady=5)
-        
-        sf = tk.Frame(settings_frame, bg=self.colors["BG"])
-        sf.pack(fill="x", padx=10, pady=10)
+        self._tz_blocks_frame = settings_frame
 
-        tk.Label(sf, text="Work Start (ET):", bg=self.colors["BG"], fg=self.colors["FG"], font=("Segoe UI", 9, "bold")).pack(side="left")
-        tk.Entry(sf, textvariable=self.var_work_start_h, bg=self.colors["INPUT"], fg=self.colors["TEXT_MAIN"], width=3, relief="flat", insertbackground=self.colors["FG"]).pack(side="left", padx=(5,0))
-        tk.Label(sf, text=":", bg=self.colors["BG"], fg=self.colors["FG"]).pack(side="left")
-        tk.Entry(sf, textvariable=self.var_work_start_m, bg=self.colors["INPUT"], fg=self.colors["TEXT_MAIN"], width=3, relief="flat", insertbackground=self.colors["FG"]).pack(side="left")
+        # Header row: personal zone + baseline + pause + add
+        sf_header = tk.Frame(settings_frame, bg=self.colors["BG"])
+        sf_header.pack(fill="x", padx=10, pady=(10, 5))
 
-        tk.Label(sf, text="  Work End:", bg=self.colors["BG"], fg=self.colors["FG"], font=("Segoe UI", 9, "bold")).pack(side="left", padx=(10,0))
-        tk.Entry(sf, textvariable=self.var_work_end_h, bg=self.colors["INPUT"], fg=self.colors["TEXT_MAIN"], width=3, relief="flat", insertbackground=self.colors["FG"]).pack(side="left", padx=(5,0))
-        tk.Label(sf, text=":", bg=self.colors["BG"], fg=self.colors["FG"]).pack(side="left")
-        tk.Entry(sf, textvariable=self.var_work_end_m, bg=self.colors["INPUT"], fg=self.colors["TEXT_MAIN"], width=3, relief="flat", insertbackground=self.colors["FG"]).pack(side="left")
+        tk.Label(sf_header, text="Personal:", bg=self.colors["BG"], fg=self.colors["FG"], font=("Segoe UI", 9, "bold")).pack(side="left")
+        cb_personal_zone = ttk.Combobox(sf_header, textvariable=self.var_personal_zone, values=TZ_LABELS, state="readonly", width=5)
+        cb_personal_zone.pack(side="left", padx=(5, 10))
+        cb_personal_zone.bind("<<ComboboxSelected>>", lambda e: self.save_global_settings())
 
-        tk.Checkbutton(sf, text="Pause TZ Automation", variable=self.var_tz_paused, command=self.save_global_settings,
-                       bg=self.colors["BG"], fg=self.colors["WARNING"], 
+        tk.Label(sf_header, text="Baseline:", bg=self.colors["BG"], fg=self.colors["FG"], font=("Segoe UI", 9, "bold")).pack(side="left")
+        cb_baseline = ttk.Combobox(sf_header, textvariable=self.var_baseline_display_zone, values=TZ_LABELS, state="readonly", width=5)
+        cb_baseline.pack(side="left", padx=(5, 10))
+        cb_baseline.bind("<<ComboboxSelected>>", lambda e: (self.save_global_settings(), self._render_tz_blocks_table()))
+        ToolTip(cb_baseline, "Display all block times converted to this zone for easy comparison")
+
+        tk.Checkbutton(sf_header, text="Pause", variable=self.var_tz_paused, command=self.save_global_settings,
+                       bg=self.colors["BG"], fg=self.colors["WARNING"],
                        activebackground=self.colors["BG"], activeforeground=self.colors["WARNING"],
-                       selectcolor=self.colors["BG"], font=("Segoe UI", 9)).pack(side="left", padx=(15, 0))
+                       selectcolor=self.colors["BG"], font=("Segoe UI", 9)).pack(side="left", padx=(5, 0))
 
-        tk.Button(sf, text="SAVE", command=self.save_global_settings, bg=self.colors["INPUT"], fg=self.colors["ACCENT"], relief="flat", font=("Segoe UI", 8, "bold")).pack(side="right")
-        self.save_dot = tk.Label(sf, text="", bg=self.colors["BG"], font=("Segoe UI", 9, "bold"))
+        tk.Button(sf_header, text="+ ADD BLOCK", command=self._add_new_block,
+                  bg=self.colors["ACCENT"], fg="white", relief="flat",
+                  font=("Segoe UI", 8, "bold")).pack(side="right")
+
+        self.save_dot = tk.Label(sf_header, text="", bg=self.colors["BG"], font=("Segoe UI", 9, "bold"))
         self.save_dot.pack(side="right", padx=(0, 5))
 
-        sf2 = tk.Frame(settings_frame, bg=self.colors["BG"])
-        sf2.pack(fill="x", padx=10, pady=(0, 10))
-        tk.Label(sf2, text="Work Days:", bg=self.colors["BG"], fg=self.colors["FG"], font=("Segoe UI", 9, "bold")).pack(side="left")
-        wd_labels = ["M", "T", "W", "T", "F", "S", "S"]
-        for i, lbl in enumerate(wd_labels):
-            tk.Checkbutton(sf2, text=lbl, variable=self.var_work_days[i], command=self.save_global_settings,
-                           bg=self.colors["BG"], fg=self.colors["FG"], selectcolor=self.colors["BG"],
-                           activebackground=self.colors["ACCENT"], activeforeground="white",
-                           highlightthickness=0, bd=0, font=("Segoe UI", 9)).pack(side="left", padx=2)
+        # DST warning banner (hidden by default)
+        self._dst_banner_frame = tk.Frame(settings_frame, bg=self.colors["ERROR"])
+        self._dst_banner_label = tk.Label(self._dst_banner_frame, text="", bg=self.colors["ERROR"], fg="white",
+                                          font=("Segoe UI", 8), wraplength=550, justify="left")
+        self._dst_banner_label.pack(side="left", fill="x", expand=True, padx=5, pady=3)
+        tk.Button(self._dst_banner_frame, text="Dismiss", command=self._dismiss_dst_warning,
+                  bg=self.colors["ERROR"], fg="white", relief="flat", font=("Segoe UI", 7)).pack(side="right", padx=5)
 
-        def _check_dirty(*args):
-            try:
-                current = (int(self.var_work_start_h.get()), int(self.var_work_start_m.get()), int(self.var_work_end_h.get()), int(self.var_work_end_m.get()), self._get_work_days_str())
-                if current != self._saved_work_hours:
-                    self.save_dot.config(text="\u2b24", fg=self.colors["WARNING"])
-                else:
-                    self.save_dot.config(text="")
-            except: pass
-        self.var_work_start_h.trace_add('write', _check_dirty)
-        self.var_work_start_m.trace_add('write', _check_dirty)
-        self.var_work_end_h.trace_add('write', _check_dirty)
-        self.var_work_end_m.trace_add('write', _check_dirty)
+        # Block table container
+        self._blocks_table_frame = tk.Frame(settings_frame, bg=self.colors["BG"])
+        self._blocks_table_frame.pack(fill="x", padx=10, pady=(0, 5))
+
+        # Block editor (hidden by default)
+        self._block_editor_frame = tk.Frame(settings_frame, bg=self.colors["INPUT"])
+        self._block_editor_built = False
+
+        self._render_tz_blocks_table()
+        self._check_dst_warning()
 
         # --- EDITOR ZONE (lazy-loaded on first Add/Edit) ---
         self._editor_anchor = tk.Frame(self.root, bg=self.colors["BG"])
@@ -1118,6 +1320,214 @@ class GawiApp:
         self.canvas.bind('<Leave>', self._unbound_to_mousewheel)
         self.canvas.pack(side="left", fill="both", expand=True, padx=(5, 0), pady=5)
         self.refresh_list()
+
+    def _render_tz_blocks_table(self):
+        for w in self._blocks_table_frame.winfo_children():
+            w.destroy()
+        self._block_widgets = {}
+        conflicts = self.detect_tz_blocks_conflicts()
+        conflict_ids = set()
+        conflict_msgs = {}
+        for a_id, b_id, msg in conflicts:
+            conflict_ids.add(a_id)
+            conflict_ids.add(b_id)
+            conflict_msgs.setdefault(a_id, []).append(msg)
+            conflict_msgs.setdefault(b_id, []).append(msg)
+
+        baseline = self.var_baseline_display_zone.get() or "ET"
+        now_utc = self.get_now_utc()
+
+        if not self.tz_blocks:
+            tk.Label(self._blocks_table_frame, text="No work blocks — always in personal zone",
+                     bg=self.colors["BG"], fg=self.colors["TEXT_DIM"],
+                     font=("Segoe UI", 9, "italic")).pack(pady=5)
+            return
+
+        for block in sorted(self.tz_blocks, key=lambda b: b['sort_order']):
+            has_conflict = block['id'] in conflict_ids
+            border_color = self.colors["ERROR"] if has_conflict else self.colors["CARD_BG"]
+            row_frame = tk.Frame(self._blocks_table_frame, bg=border_color, bd=1, relief="solid")
+            row_frame.pack(fill="x", pady=1)
+            inner = tk.Frame(row_frame, bg=self.colors["CARD_BG"])
+            inner.pack(fill="x", padx=1, pady=1)
+
+            # Convert block times to baseline zone for display
+            ref_date = now_utc.replace(hour=0, minute=0, second=0)
+            block_start_local = ref_date.replace(hour=block['start_h'], minute=block['start_m'])
+            block_end_local = ref_date.replace(hour=block['end_h'], minute=block['end_m'])
+            start_utc = self.convert_zone_to_utc(block_start_local, block['zone'])
+            end_utc = self.convert_zone_to_utc(block_end_local, block['zone'])
+            start_baseline = self.convert_utc_to_zone(start_utc, baseline)
+            end_baseline = self.convert_utc_to_zone(end_utc, baseline)
+            start_str = start_baseline.strftime("%I:%M %p").lstrip("0")
+            end_str = end_baseline.strftime("%I:%M %p").lstrip("0")
+
+            day_names = {0:"Mon",1:"Tue",2:"Wed",3:"Thu",4:"Fri",5:"Sat",6:"Sun"}
+            days_list = sorted(int(d) for d in block['active_days'].split(',') if d.strip().isdigit())
+            if days_list == [0,1,2,3,4]:
+                days_str = "Mon-Fri"
+            elif days_list == [0,1,2,3,4,5,6]:
+                days_str = "Every day"
+            else:
+                days_str = ",".join(day_names.get(d, str(d)) for d in days_list)
+
+            tk.Label(inner, text=block['zone'], bg=self.colors["CARD_BG"], fg=self.colors["ACCENT"],
+                     font=("Segoe UI", 9, "bold"), width=4).pack(side="left", padx=(5, 5))
+            tk.Label(inner, text=f"{start_str} - {end_str}", bg=self.colors["CARD_BG"], fg=self.colors["TEXT_MAIN"],
+                     font=("Segoe UI", 9)).pack(side="left", padx=(0, 5))
+            tk.Label(inner, text=f"(in {baseline})", bg=self.colors["CARD_BG"], fg=self.colors["TEXT_DIM"],
+                     font=("Segoe UI", 7)).pack(side="left", padx=(0, 5))
+            tk.Label(inner, text=days_str, bg=self.colors["CARD_BG"], fg=self.colors["TEXT_DIM"],
+                     font=("Segoe UI", 8)).pack(side="left", padx=(5, 5))
+
+            if has_conflict:
+                conflict_tip = "; ".join(conflict_msgs.get(block['id'], []))
+                warn_lbl = tk.Label(inner, text="\u26a0", bg=self.colors["CARD_BG"], fg=self.colors["ERROR"],
+                                    font=("Segoe UI", 10))
+                warn_lbl.pack(side="left", padx=2)
+                ToolTip(warn_lbl, conflict_tip)
+            else:
+                tk.Label(inner, text="\u2713", bg=self.colors["CARD_BG"], fg=self.colors["SUCCESS"],
+                         font=("Segoe UI", 9)).pack(side="left", padx=2)
+
+            bid = block['id']
+            btn_frame = tk.Frame(inner, bg=self.colors["CARD_BG"])
+            btn_frame.pack(side="right", padx=5)
+            tk.Button(btn_frame, text="\u25b2", command=lambda b=bid: self.reorder_tz_blocks(b, "up"),
+                      bg=self.colors["CARD_BG"], fg=self.colors["TEXT_DIM"], relief="flat",
+                      font=("Segoe UI", 7), width=2).pack(side="left")
+            tk.Button(btn_frame, text="\u25bc", command=lambda b=bid: self.reorder_tz_blocks(b, "down"),
+                      bg=self.colors["CARD_BG"], fg=self.colors["TEXT_DIM"], relief="flat",
+                      font=("Segoe UI", 7), width=2).pack(side="left")
+            tk.Button(btn_frame, text="Edit", command=lambda b=bid: self._edit_tz_block(b),
+                      bg=self.colors["CARD_BG"], fg=self.colors["BTN_EDIT"], relief="flat",
+                      font=("Segoe UI", 7, "bold"), width=3).pack(side="left", padx=(3,0))
+
+            self._block_widgets[bid] = row_frame
+
+    def _add_new_block(self):
+        self._show_block_editor(None)
+
+    def _edit_tz_block(self, block_id):
+        self._show_block_editor(block_id)
+
+    def _show_block_editor(self, block_id):
+        self.selected_block_id = block_id
+        if self._block_editor_built:
+            self._block_editor_frame.pack_forget()
+        # Build editor inline
+        for w in self._block_editor_frame.winfo_children():
+            w.destroy()
+        self._block_editor_frame.configure(bg=self.colors["INPUT"])
+
+        if block_id:
+            block = next((b for b in self.tz_blocks if b['id'] == block_id), None)
+        else:
+            block = None
+
+        ef = tk.Frame(self._block_editor_frame, bg=self.colors["INPUT"])
+        ef.pack(fill="x", padx=10, pady=8)
+
+        # Row 1: Zone + Start + End
+        var_zone = tk.StringVar(value=block['zone'] if block else "ET")
+        var_start_h = tk.StringVar(value=f"{block['start_h']:02d}" if block else "09")
+        var_start_m = tk.StringVar(value=f"{block['start_m']:02d}" if block else "00")
+        var_end_h = tk.StringVar(value=f"{block['end_h']:02d}" if block else "17")
+        var_end_m = tk.StringVar(value=f"{block['end_m']:02d}" if block else "00")
+
+        tk.Label(ef, text="Zone:", bg=self.colors["INPUT"], fg=self.colors["FG"], font=("Segoe UI", 9, "bold")).pack(side="left")
+        cb_zone = ttk.Combobox(ef, textvariable=var_zone, values=TZ_LABELS, state="readonly", width=5)
+        cb_zone.pack(side="left", padx=(5, 10))
+
+        tk.Label(ef, text="Start:", bg=self.colors["INPUT"], fg=self.colors["FG"], font=("Segoe UI", 9, "bold")).pack(side="left")
+        tk.Entry(ef, textvariable=var_start_h, bg=self.colors["BG"], fg=self.colors["TEXT_MAIN"], width=3, relief="flat", insertbackground=self.colors["FG"]).pack(side="left", padx=(5,0))
+        tk.Label(ef, text=":", bg=self.colors["INPUT"], fg=self.colors["FG"]).pack(side="left")
+        tk.Entry(ef, textvariable=var_start_m, bg=self.colors["BG"], fg=self.colors["TEXT_MAIN"], width=3, relief="flat", insertbackground=self.colors["FG"]).pack(side="left")
+
+        tk.Label(ef, text="  End:", bg=self.colors["INPUT"], fg=self.colors["FG"], font=("Segoe UI", 9, "bold")).pack(side="left", padx=(10, 0))
+        tk.Entry(ef, textvariable=var_end_h, bg=self.colors["BG"], fg=self.colors["TEXT_MAIN"], width=3, relief="flat", insertbackground=self.colors["FG"]).pack(side="left", padx=(5,0))
+        tk.Label(ef, text=":", bg=self.colors["INPUT"], fg=self.colors["FG"]).pack(side="left")
+        tk.Entry(ef, textvariable=var_end_m, bg=self.colors["BG"], fg=self.colors["TEXT_MAIN"], width=3, relief="flat", insertbackground=self.colors["FG"]).pack(side="left")
+
+        # Row 2: Days + Buttons
+        ef2 = tk.Frame(self._block_editor_frame, bg=self.colors["INPUT"])
+        ef2.pack(fill="x", padx=10, pady=(0, 8))
+
+        tk.Label(ef2, text="Days:", bg=self.colors["INPUT"], fg=self.colors["FG"], font=("Segoe UI", 9, "bold")).pack(side="left")
+        block_day_vars = [tk.IntVar(value=0) for _ in range(7)]
+        if block:
+            active = set(int(d) for d in block['active_days'].split(',') if d.strip().isdigit())
+            for i in range(7):
+                block_day_vars[i].set(1 if i in active else 0)
+        else:
+            for i in range(5):
+                block_day_vars[i].set(1)
+        wd_labels = ["M", "T", "W", "T", "F", "S", "S"]
+        for i, lbl in enumerate(wd_labels):
+            tk.Checkbutton(ef2, text=lbl, variable=block_day_vars[i],
+                           bg=self.colors["INPUT"], fg=self.colors["FG"], selectcolor=self.colors["INPUT"],
+                           activebackground=self.colors["ACCENT"], activeforeground="white",
+                           highlightthickness=0, bd=0, font=("Segoe UI", 9)).pack(side="left", padx=2)
+
+        # Buttons (right-aligned)
+        def _save_block():
+            try:
+                s_h = int(var_start_h.get().strip())
+                s_m = int(var_start_m.get().strip())
+                e_h = int(var_end_h.get().strip())
+                e_m = int(var_end_m.get().strip())
+                if not (0 <= s_h <= 23 and 0 <= s_m <= 59 and 0 <= e_h <= 23 and 0 <= e_m <= 59):
+                    return
+            except ValueError:
+                return
+            days = ','.join(str(i) for i in range(7) if block_day_vars[i].get() == 1)
+            if not days:
+                return
+            bd = {'zone': var_zone.get(), 'start_h': s_h, 'start_m': s_m, 'end_h': e_h, 'end_m': e_m, 'active_days': days}
+            if block_id:
+                bd['id'] = block_id
+            self.save_tz_block(bd)
+            self._block_editor_frame.pack_forget()
+            self._block_editor_built = False
+
+        def _delete_block():
+            if block_id:
+                self.delete_tz_block(block_id)
+            self._block_editor_frame.pack_forget()
+            self._block_editor_built = False
+
+        def _cancel_block():
+            self._block_editor_frame.pack_forget()
+            self._block_editor_built = False
+
+        tk.Button(ef2, text="SAVE", command=_save_block,
+                  bg=self.colors["ACCENT"], fg="white", relief="flat",
+                  font=("Segoe UI", 8, "bold")).pack(side="right", padx=(3, 0))
+        tk.Button(ef2, text="CANCEL", command=_cancel_block,
+                  bg=self.colors["CARD_BG"], fg=self.colors["FG"], relief="flat",
+                  font=("Segoe UI", 8)).pack(side="right", padx=(3, 0))
+        if block_id:
+            tk.Button(ef2, text="DELETE", command=_delete_block,
+                      bg=self.colors["BTN_DEL"], fg="white", relief="flat",
+                      font=("Segoe UI", 8, "bold")).pack(side="right", padx=(3, 0))
+
+        self._block_editor_frame.pack(fill="x", padx=10, pady=(0, 8))
+        self._block_editor_built = True
+
+    def _dismiss_dst_warning(self):
+        self._dst_warning_dismissed = True
+        self._dst_banner_frame.pack_forget()
+
+    def _check_dst_warning(self):
+        if self._dst_warning_dismissed:
+            return
+        now_utc = self.get_now_utc()
+        warning = self.get_dst_warning_if_needed(now_utc)
+        if warning:
+            self._dst_banner_label.config(text=f"\u26a0 {warning}")
+            self._dst_banner_frame.pack(fill="x", padx=10, pady=(0, 5), before=self._blocks_table_frame)
+        else:
+            self._dst_banner_frame.pack_forget()
 
     def _open_editor(self):
         self._ensure_editor()
@@ -1213,11 +1623,8 @@ class GawiApp:
         self.e_ot_yy.bind("<KeyRelease>", lambda e: self._auto_tab(e, self.v_tt_yy, 2, self.e_ot_h))
         self.e_ot_h.bind("<KeyRelease>", lambda e: self._auto_tab(e, self.v_tt_hh, 2, self.e_ot_m))
 
-        radio_frame = tk.Frame(self.one_time_frame, bg=self.colors["BG"], highlightthickness=0, bd=0)
-        radio_frame.pack(side="left", padx=10)
-
-        ttk.Radiobutton(radio_frame, text="PHT", variable=self.v_tt_tz, value="PHT", style="TRadiobutton").pack(side="left", padx=2)
-        ttk.Radiobutton(radio_frame, text="ET", variable=self.v_tt_tz, value="ET", style="TRadiobutton").pack(side="left", padx=2)
+        self.cb_tt_tz = ttk.Combobox(self.one_time_frame, textvariable=self.v_tt_tz, values=TZ_LABELS, state="readonly", width=5)
+        self.cb_tt_tz.pack(side="left", padx=10)
 
         quick_frame = tk.Frame(self.one_time_frame, bg=self.colors["BG"], highlightthickness=0, bd=0)
         quick_frame.pack(side="right")
@@ -1363,7 +1770,7 @@ class GawiApp:
 
         self.lbl_in = tk.Label(self.hours_frame, text=" in ", bg=self.colors["BG"], fg=self.colors["FG"])
         self.lbl_in.pack(side="left")
-        self.cb_timezone = ttk.Combobox(self.hours_frame, textvariable=self.v_timezone, values=["PHT", "ET"], state="readonly", width=6)
+        self.cb_timezone = ttk.Combobox(self.hours_frame, textvariable=self.v_timezone, values=TZ_LABELS, state="readonly", width=6)
         self.cb_timezone.pack(side="left")
 
         self.toggle_hours_entry()
@@ -1395,7 +1802,7 @@ class GawiApp:
         self.cb_pattern_minute.pack(side="left")
 
         self.cb_pattern_timezone = ttk.Combobox(self.pattern_frame, textvariable=self.v_pattern_timezone,
-                                               values=["PHT", "ET"], state="readonly", width=6)
+                                               values=TZ_LABELS, state="readonly", width=6)
         self.cb_pattern_timezone.pack(side="left", padx=(5, 0))
 
         def set_pattern_to_now():
@@ -2041,7 +2448,7 @@ class GawiApp:
             if not item.get('lbl_status'):
                 continue
             tz_label = item.get('timezone', 'ET')
-            display_tz = "ET" if self.cached_tz == EASTERN_TZ_ID else "PHT"
+            display_tz = self._tz_label_from_windows_id(self.cached_tz) if self.cached_tz else self._get_personal_zone()
             trig_disp = "??"
             if item['next_trigger']:
                 try:
@@ -2084,7 +2491,7 @@ class GawiApp:
             is_past = False
             
             tz_label = item.get('timezone', 'ET')
-            display_tz = "ET" if self.cached_tz == EASTERN_TZ_ID else "PHT"
+            display_tz = self._tz_label_from_windows_id(self.cached_tz) if self.cached_tz else self._get_personal_zone()
 
             if item['next_trigger']:
                 try:
@@ -2426,6 +2833,11 @@ class GawiApp:
                     self.check_and_switch_timezone(now_utc)
                     self.gui_queue.put(('UPDATE_ICON',))
                     self.next_tz_check = now_utc + timedelta(seconds=60)
+                    # Daily DST warning check (midnight UTC)
+                    if now_utc.hour == 0 and now_utc.minute < 1 and not self._dst_warning_dismissed:
+                        warning = self.get_dst_warning_if_needed(now_utc)
+                        if warning:
+                            self.gui_queue.put(('DST_WARNING', warning))
 
                 needs_status_update = False
                 for item in self.cache:
@@ -2518,6 +2930,13 @@ class GawiApp:
                             pass
                 elif cmd == 'UNINSTALL':
                     self.uninstall_app()
+                elif cmd == 'REFRESH_TZ_BLOCKS_UI':
+                    self._render_tz_blocks_table()
+                    self._check_dst_warning()
+                elif cmd == 'DST_WARNING':
+                    if not self._dst_warning_dismissed and len(msg) > 1:
+                        self._dst_banner_label.config(text=f"\u26a0 {msg[1]}")
+                        self._dst_banner_frame.pack(fill="x", padx=10, pady=(0, 5), before=self._blocks_table_frame)
                 elif cmd == 'SAVE_FEEDBACK':
                     try:
                         self.save_dot.config(text="\u2713", fg=self.colors["ACCENT"])
