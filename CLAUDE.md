@@ -15,6 +15,7 @@
 5. **NEVER use `datetime.now()` anywhere in scheduling logic.** All engine logic uses `self.get_now_utc()` which returns a naive UTC datetime. The system clock is untrusted because the Timezone Switcher actively changes the Windows timezone.
 6. **Prefer repetition over abstraction in UI code.** Verbose, repeated widget blocks are intentional — they allow surgical edits without breaking adjacent rows. Don't refactor UI blocks into helpers unless explicitly asked.
 7. **Always update this file (CLAUDE.md / agent.md) after completing a feature or confirming a bug fix.** Move items from Active Bugs → Recently Fixed, update Roadmap checkboxes, bump version notes.
+8. **Always push to GitHub after committing.** Don't ask — just `git push` after every commit.
 
 ### How to Make Changes
 
