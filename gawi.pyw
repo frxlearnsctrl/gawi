@@ -1376,9 +1376,9 @@ class GawiApp:
             has_conflict = block['id'] in conflict_ids
             border_color = self.colors["ERROR"] if has_conflict else self.colors["CARD_BG"]
             row_frame = tk.Frame(self._blocks_table_frame, bg=border_color, bd=1, relief="solid")
-            row_frame.pack(fill="x", pady=1)
+            row_frame.pack(fill="x", pady=2)
             inner = tk.Frame(row_frame, bg=self.colors["CARD_BG"])
-            inner.pack(fill="x", padx=1, pady=1)
+            inner.pack(fill="x", padx=1, pady=3)
 
             # Convert block times to baseline zone for display
             ref_date = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -1403,36 +1403,36 @@ class GawiApp:
                 days_str = ",".join(day_names.get(d, str(d)) for d in days_list)
 
             tk.Label(inner, text=block['zone'], bg=self.colors["CARD_BG"], fg=self.colors["ACCENT"],
-                     font=("Segoe UI", 9, "bold"), width=4).pack(side="left", padx=(5, 5))
+                     font=("Segoe UI", 11, "bold"), width=4).pack(side="left", padx=(8, 5))
             tk.Label(inner, text=f"{start_str} - {end_str}", bg=self.colors["CARD_BG"], fg=self.colors["TEXT_MAIN"],
-                     font=("Segoe UI", 9)).pack(side="left", padx=(0, 5))
+                     font=("Segoe UI", 10)).pack(side="left", padx=(0, 5))
             tk.Label(inner, text=f"(in {baseline})", bg=self.colors["CARD_BG"], fg=self.colors["TEXT_DIM"],
-                     font=("Segoe UI", 7)).pack(side="left", padx=(0, 5))
+                     font=("Segoe UI", 8)).pack(side="left", padx=(0, 8))
             tk.Label(inner, text=days_str, bg=self.colors["CARD_BG"], fg=self.colors["TEXT_DIM"],
-                     font=("Segoe UI", 8)).pack(side="left", padx=(5, 5))
+                     font=("Segoe UI", 9)).pack(side="left", padx=(5, 5))
 
             if has_conflict:
                 conflict_tip = "; ".join(conflict_msgs.get(block['id'], []))
                 warn_lbl = tk.Label(inner, text="\u26a0", bg=self.colors["CARD_BG"], fg=self.colors["ERROR"],
-                                    font=("Segoe UI", 10))
+                                    font=("Segoe UI", 11))
                 warn_lbl.pack(side="left", padx=2)
                 ToolTip(warn_lbl, conflict_tip)
             else:
                 tk.Label(inner, text="\u2713", bg=self.colors["CARD_BG"], fg=self.colors["SUCCESS"],
-                         font=("Segoe UI", 9)).pack(side="left", padx=2)
+                         font=("Segoe UI", 10)).pack(side="left", padx=2)
 
             bid = block['id']
             btn_frame = tk.Frame(inner, bg=self.colors["CARD_BG"])
             btn_frame.pack(side="right", padx=5)
             tk.Button(btn_frame, text="\u25b2", command=lambda b=bid: self.reorder_tz_blocks(b, "up"),
                       bg=self.colors["CARD_BG"], fg=self.colors["TEXT_DIM"], relief="flat",
-                      font=("Segoe UI", 7), width=2).pack(side="left")
+                      font=("Segoe UI", 9), width=2).pack(side="left")
             tk.Button(btn_frame, text="\u25bc", command=lambda b=bid: self.reorder_tz_blocks(b, "down"),
                       bg=self.colors["CARD_BG"], fg=self.colors["TEXT_DIM"], relief="flat",
-                      font=("Segoe UI", 7), width=2).pack(side="left")
+                      font=("Segoe UI", 9), width=2).pack(side="left")
             tk.Button(btn_frame, text="Edit", command=lambda b=bid: self._edit_tz_block(b),
                       bg=self.colors["CARD_BG"], fg=self.colors["BTN_EDIT"], relief="flat",
-                      font=("Segoe UI", 7, "bold"), width=3).pack(side="left", padx=(3,0))
+                      font=("Segoe UI", 9, "bold"), width=4).pack(side="left", padx=(3,0))
 
             self._block_widgets[bid] = row_frame
 
