@@ -19,7 +19,7 @@ import winreg
 # --- CONFIGURATION ---
 ICON_FILE = 'icon2.png'
 CHECK_INTERVAL = 5
-APP_ID = 'Gawi.Pro.v9.9.4'
+APP_ID = 'Gawi.Pro.v9.9.5'
 
 # Timezone Registry — all supported timezones
 TZ_REGISTRY = {

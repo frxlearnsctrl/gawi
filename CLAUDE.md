@@ -335,7 +335,7 @@ Palette is stored in `self.colors`. All widgets reference `self.colors["KEY"]`. 
 ## Configuration Constants
 
 ```python
-APP_ID = 'Gawi.Pro.v9.9.4'
+APP_ID = 'Gawi.Pro.v9.9.5'
 CHECK_INTERVAL = 5          # seconds between check_loop iterations
 TZ_REGISTRY = {...}         # Dict of 7 zones: ET, CT, MT, PT, PHT, JST, GMT — each with windows_id, base_offset, has_dst, dst_offset
 TZ_LABELS = sorted(TZ_REGISTRY.keys())  # Alphabetically sorted list for UI dropdowns
@@ -358,6 +358,14 @@ Registry key for startup: `HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentV
 
 ### Recently Fixed
 
+- ✅ **P1 — Day-of-week timezone mismatch** (v9.9.5): `calculate_next_trigger_with_pattern` and `check_loop` used `timezone` (active hours TZ) for day validation instead of `pattern_timezone`. UTC→ET weekday != UTC→PHT weekday near midnight, causing reminders to land on wrong days. Fixed by using `pattern_tz` when `use_start_pattern=1`.
+- ✅ **P1 — SQL injection in `bg_save_item`** (v9.9.5): Column names from dict keys were interpolated into f-string SQL. Added `ALLOWED_REMINDER_COLUMNS` frozenset whitelist — only whitelisted column names reach the query.
+- ✅ **P1 — Command injection in `set_timezone`** (v9.9.5): `timezone_id` passed directly to PowerShell. Now validated against `TZ_REGISTRY` valid Windows IDs before execution; cache reverts on failure.
+- ✅ **P1 — Command injection in `set_startup_registry`** (v9.9.5): Paths with single quotes could break PowerShell shortcut creation. Fixed with `'` → `''` escaping.
+- ✅ **P2 — Race condition on `active_popups`** (v9.9.5): Checker thread and main thread accessed `active_popups` set without synchronization. Added `threading.Lock` wrapping all access points.
+- ✅ **P2 — DB connection leak in `bg_save_item`** (v9.9.5): `conn.close()` in try block skipped on exception. Fixed with `try/finally` pattern.
+- ✅ **P3 — Bare except clauses** (v9.9.5): `init_db`, `bg_delete_item`, `get_current_timezone`, `_is_gawi_process` — all now catch `Exception` instead of bare `except:` and log errors.
+- ✅ **P3 — `datetime.now()` in one-time task year default** (v9.9.5): Replaced with `self.get_now_utc().strftime("%y")` to stay consistent with UTC-first engine.
 - ✅ **P1 — `get_next_valid_time` loop indentation** (v9.8): `candidate_utc += timedelta(minutes=1)` moved inside the `for` loop so it actually iterates through candidate minutes
 - ✅ **P1 — Hibernate/resume pattern anchor** (v9.8): `reset_stale_reminders()` now checks `use_start_pattern` and routes to `calculate_next_trigger_with_pattern()` to preserve the anchor grid
 - ✅ **P2 — Header TZ flicker** (v9.8): Introduced `self.cached_tz` — `update_header()` reads cache instead of spawning PowerShell subprocess on main thread every 5s. `set_timezone()` updates cache optimistically before async thread
@@ -448,6 +456,16 @@ Registry key for startup: `HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentV
 - [x] Day number validation clamped to 0-6 on load
 - [x] CANCEL button properly initialized (pack then pack_forget)
 
+**Phase 3.3 — Security + Correctness (v9.9.5)** ✅
+- [x] Fix day-of-week timezone mismatch in pattern scheduling (P1) — pattern_tz vs active_tz
+- [x] Fix SQL injection in `bg_save_item` (P1) — ALLOWED_REMINDER_COLUMNS whitelist
+- [x] Fix command injection in `set_timezone` (P1) — validate against TZ_REGISTRY
+- [x] Fix command injection in `set_startup_registry` (P1) — PowerShell single-quote escaping
+- [x] Fix race condition on `active_popups` (P2) — threading.Lock
+- [x] Fix DB connection leak in `bg_save_item` (P2) — try/finally
+- [x] Replace bare except clauses with `except Exception` (P3)
+- [x] Replace `datetime.now()` with `get_now_utc()` in one-time task year default (P3)
+
 **Future**
 - [ ] Analytics logs table + dashboard UI
 - [x] Interval presets dropdown (15m–Monthly + custom input)
@@ -465,7 +483,18 @@ Registry key for startup: `HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentV
 
 ## Version History
 
-### v9.9.4 (Current)
+### v9.9.5 (Current)
+- **Security + Correctness Hardening**
+- P1: Day-of-week timezone mismatch — `calculate_next_trigger_with_pattern` and `check_loop` now use `pattern_timezone` (not `timezone`) for weekday validation when `use_start_pattern=1`. Fixes reminders landing on wrong days when pattern TZ and active hours TZ straddle midnight differently.
+- P1: SQL injection in `bg_save_item` — `ALLOWED_REMINDER_COLUMNS` frozenset whitelist prevents arbitrary column names in SQL
+- P1: Command injection in `set_timezone` — validates `timezone_id` against `TZ_REGISTRY` valid Windows IDs; reverts cache on failure
+- P1: Command injection in `set_startup_registry` — PowerShell single-quote escaping (`'` → `''`) for paths
+- P2: Race condition on `active_popups` — `threading.Lock` wraps all read/write access (checker thread, main thread, tray icon)
+- P2: DB connection leak in `bg_save_item` — `try/finally` ensures `conn.close()` runs on exception
+- P3: Bare `except:` → `except Exception:` with logging in `init_db`, `bg_delete_item`, `get_current_timezone`, `_is_gawi_process`
+- P3: `datetime.now()` → `self.get_now_utc()` for one-time task year default
+
+### v9.9.4
 - **Multi-Zone Time Blocks**
 - New `tz_blocks` table: zone, start/end hours, active days, sort_order — supports unlimited work blocks
 - `find_active_tz_block()` replaces `should_be_in_work_zone()` — first-match-wins priority for multiple overlapping blocks
