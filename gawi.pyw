@@ -1402,14 +1402,16 @@ class GawiApp:
             else:
                 days_str = ",".join(day_names.get(d, str(d)) for d in days_list)
 
+            row_font = ("Segoe UI", 10)
             tk.Label(inner, text=block['zone'], bg=self.colors["CARD_BG"], fg=self.colors["ACCENT"],
-                     font=("Segoe UI", 11, "bold"), width=4).pack(side="left", padx=(8, 5))
+                     font=("Segoe UI", 10, "bold"), width=4).pack(side="left", padx=(8, 5))
             tk.Label(inner, text=f"{start_str} - {end_str}", bg=self.colors["CARD_BG"], fg=self.colors["TEXT_MAIN"],
-                     font=("Segoe UI", 10)).pack(side="left", padx=(0, 5))
-            tk.Label(inner, text=f"(in {baseline})", bg=self.colors["CARD_BG"], fg=self.colors["TEXT_DIM"],
-                     font=("Segoe UI", 8)).pack(side="left", padx=(0, 8))
+                     font=row_font).pack(side="left", padx=(0, 5))
+            if baseline != block['zone']:
+                tk.Label(inner, text=f"(in {baseline})", bg=self.colors["CARD_BG"], fg=self.colors["TEXT_DIM"],
+                         font=row_font).pack(side="left", padx=(0, 8))
             tk.Label(inner, text=days_str, bg=self.colors["CARD_BG"], fg=self.colors["TEXT_DIM"],
-                     font=("Segoe UI", 9)).pack(side="left", padx=(5, 5))
+                     font=row_font).pack(side="left", padx=(5, 5))
 
             if has_conflict:
                 conflict_tip = "; ".join(conflict_msgs.get(block['id'], []))
