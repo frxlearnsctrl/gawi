@@ -176,6 +176,7 @@ class GawiApp:
         self.init_state_variables()
 
         self.active_popups = set()
+        self._popups_lock = threading.Lock()
         self.last_trigger_minute = {}
         self.cached_tz = None
         self._saved_work_hours = (7, 0, 17, 0, '0,1,2,3,4', 'ET', 'PHT', 'ET')
@@ -461,10 +462,15 @@ class GawiApp:
                 creationflags=subprocess.CREATE_NO_WINDOW
             )
             return result.stdout.strip()
-        except:
+        except Exception as e:
+            print(f"[get_current_timezone] Error: {e}")
             return None
 
     def set_timezone(self, timezone_id):
+        valid_tz_ids = {tz["windows_id"] for tz in TZ_REGISTRY.values()}
+        if timezone_id not in valid_tz_ids:
+            print(f"[set_timezone] Rejected invalid timezone_id: {timezone_id}")
+            return
         self.cached_tz = timezone_id
         def _set_tz():
             try:
@@ -481,6 +487,7 @@ class GawiApp:
                 self.gui_queue.put(('UPDATE_ICON',))
             except Exception as e:
                 print(f"Error switching timezone: {e}")
+                self.cached_tz = self.get_current_timezone()
 
         threading.Thread(target=_set_tz, daemon=True).start()
 
@@ -583,7 +590,9 @@ class GawiApp:
             y = (height - text_height) // 2 - 2
             dc.text((x, y), countdown_text, fill=color, font=font)
 
-        if len(self.active_popups) > 0:
+        with self._popups_lock:
+            has_popups = len(self.active_popups) > 0
+        if has_popups:
             badge_radius = 8
             dc.ellipse([width - (badge_radius*2), 0, width, badge_radius*2], fill="#e74c3c")
 
@@ -668,7 +677,7 @@ class GawiApp:
                 else:
                     anchor_utc += timedelta(hours=1)
         
-        return self.get_next_valid_time(anchor_utc, 0, use_hours, s_h, s_m, e_h, e_m, days_str, active_tz)
+        return self.get_next_valid_time(anchor_utc, 0, use_hours, s_h, s_m, e_h, e_m, days_str, pattern_tz)
 
     def get_next_valid_time(self, start_time_utc, interval_mins, use_hours, s_h, s_m, e_h, e_m, days_str, tz_label="ET"):
         candidate_utc = start_time_utc + timedelta(minutes=interval_mins)
@@ -709,7 +718,7 @@ class GawiApp:
                 return name in ('pythonw.exe', 'python.exe', 'gawi.exe')
             finally:
                 kernel32.CloseHandle(handle)
-        except:
+        except Exception:
             return False
 
     def acquire_lock(self):
@@ -758,9 +767,9 @@ class GawiApp:
             ctypes.windll.shell32.SHGetFolderPathW(None, CSIDL_STARTUP, None, 0, buf)
             shortcut_path = os.path.join(buf.value, "Gawi.lnk")
             if enable:
-                exe_path = sys.executable.replace("\\", "\\\\")
-                sc_path = shortcut_path.replace("\\", "\\\\")
-                ps_cmd = f'$ws = New-Object -ComObject WScript.Shell; $s = $ws.CreateShortcut("{sc_path}"); $s.TargetPath = "{exe_path}"; $s.Save()'
+                exe_path = sys.executable.replace("'", "''")
+                sc_path = shortcut_path.replace("'", "''")
+                ps_cmd = f"$ws = New-Object -ComObject WScript.Shell; $s = $ws.CreateShortcut('{sc_path}'); $s.TargetPath = '{exe_path}'; $s.Save()"
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
                 startupinfo.wShowWindow = subprocess.SW_HIDE
@@ -885,8 +894,8 @@ class GawiApp:
             if col not in cols:
                 try:
                     c.execute(f"ALTER TABLE reminders ADD COLUMN {col} {dtype}")
-                except:
-                    pass
+                except Exception as e:
+                    print(f"[init_db] Migration failed for reminders.{col}: {e}")
 
         c.execute('''CREATE TABLE IF NOT EXISTS settings
                      (id INTEGER PRIMARY KEY,
@@ -907,7 +916,7 @@ class GawiApp:
         for col, dtype in [('window_x', 'INTEGER DEFAULT NULL'), ('window_y', 'INTEGER DEFAULT NULL'), ('work_days', "TEXT DEFAULT '0,1,2,3,4'"), ('work_zone', "TEXT DEFAULT 'ET'"), ('personal_zone', "TEXT DEFAULT 'PHT'"), ('baseline_display_zone', "TEXT DEFAULT 'ET'")]:
             if col not in settings_cols:
                 try: c.execute(f"ALTER TABLE settings ADD COLUMN {col} {dtype}")
-                except: pass
+                except Exception as e: print(f"[init_db] Migration failed for settings.{col}: {e}")
 
         c.execute('''CREATE TABLE IF NOT EXISTS tz_blocks
                      (id INTEGER PRIMARY KEY,
@@ -1113,35 +1122,50 @@ class GawiApp:
         except Exception as e:
             pass
 
+    ALLOWED_REMINDER_COLUMNS = frozenset({
+        'id', 'title', 'message', 'next_trigger', 'interval_minutes', 'sound',
+        'active_days', 'start_hour', 'start_minute', 'end_hour', 'end_minute',
+        'double_check', 'confirm_msg', 'use_active_hours', 'is_active', 'sort_order',
+        'popup_bg_color', 'timezone', 'enable_snooze', 'max_snoozes', 'snoozes_used',
+        'use_start_pattern', 'pattern_hour', 'pattern_minute', 'pattern_timezone',
+        'snooze_behavior', 'is_one_time', 'one_time_date'
+    })
+
     def bg_save_item(self, item_dict):
         def worker():
+            conn = None
             try:
                 conn = sqlite3.connect(DB_FILE)
                 c = conn.cursor()
                 if 'id' in item_dict and item_dict['id'] is not None:
-                    cols = [k for k in item_dict.keys() if k not in ['widget_ref', 'lbl_title', 'lbl_status']]
-                    vals = [item_dict[k] for k in cols]
-                    cols.remove('id')
+                    cols = [k for k in item_dict.keys() if k not in ('widget_ref', 'lbl_title', 'lbl_status', 'id') and k in self.ALLOWED_REMINDER_COLUMNS]
+                    if not cols:
+                        return
                     vals_ordered = [item_dict[k] for k in cols]
                     vals_ordered.append(item_dict['id'])
                     set_clause = ", ".join([f"{c}=?" for c in cols])
                     c.execute(f"UPDATE reminders SET {set_clause} WHERE id=?", vals_ordered)
                 conn.commit()
-                conn.close()
             except Exception as e:
-                pass
+                print(f"[bg_save_item] Error: {e}")
+            finally:
+                if conn:
+                    conn.close()
         threading.Thread(target=worker, daemon=True).start()
 
     def bg_delete_item(self, r_id):
         def worker():
+            conn = None
             try:
                 conn = sqlite3.connect(DB_FILE)
                 c = conn.cursor()
                 c.execute("DELETE FROM reminders WHERE id=?", (r_id,))
                 conn.commit()
-                conn.close()
-            except:
-                pass
+            except Exception as e:
+                print(f"[bg_delete_item] Error: {e}")
+            finally:
+                if conn:
+                    conn.close()
         threading.Thread(target=worker, daemon=True).start()
 
     def bg_save_order(self):
@@ -2229,7 +2253,7 @@ class GawiApp:
         self.var_one_time.set(0)
         self.v_tt_mm.set("")
         self.v_tt_dd.set("")
-        self.v_tt_yy.set(datetime.now().strftime("%y"))
+        self.v_tt_yy.set(self.get_now_utc().strftime("%y"))
         self.v_tt_hh.set("")
         self.v_tt_min.set("")
         self.v_tt_tz.set("PHT")
@@ -2702,17 +2726,17 @@ class GawiApp:
                         self.bg_save_item({'id': r_id, 'next_trigger': next_trig, 'snoozes_used': new_snoozes_used})
                         self.gui_queue.put(('REFRESH_LIST',))
                         
-                        if r_id in self.active_popups:
-                            self.active_popups.remove(r_id)
-                        
+                        with self._popups_lock:
+                            self.active_popups.discard(r_id)
+
                         self.gui_queue.put(('UPDATE_ICON',))
                         popup.destroy()
-                        
+
                     except Exception as e:
                         try:
                             stop_sound.set()
-                            if r_id in self.active_popups:
-                                self.active_popups.remove(r_id)
+                            with self._popups_lock:
+                                self.active_popups.discard(r_id)
                             self.gui_queue.put(('UPDATE_ICON',))
                             popup.destroy()
                         except:
@@ -2785,21 +2809,21 @@ class GawiApp:
                         self.bg_save_item({'id': r_id, 'next_trigger': next_trig, 'snoozes_used': 0})
 
                 self.gui_queue.put(('REFRESH_LIST',))
-                
-                if r_id in self.active_popups:
-                    self.active_popups.remove(r_id)
-                
+
+                with self._popups_lock:
+                    self.active_popups.discard(r_id)
+
                 self.gui_queue.put(('UPDATE_ICON',))
                 popup.destroy()
-                
+
             except Exception as e:
                 try:
                     stop_sound.set()
                 except:
                     pass
                 try:
-                    if r_id in self.active_popups:
-                        self.active_popups.remove(r_id)
+                    with self._popups_lock:
+                        self.active_popups.discard(r_id)
                     self.gui_queue.put(('UPDATE_ICON',))
                 except:
                     pass
@@ -2881,8 +2905,9 @@ class GawiApp:
 
                     if now_utc >= trig_time:
                         r_id = item['id']
-                        if r_id in self.active_popups:
-                            continue
+                        with self._popups_lock:
+                            if r_id in self.active_popups:
+                                continue
 
                         if self.last_trigger_minute.get(r_id) == now_str_min:
                             continue
@@ -2893,20 +2918,37 @@ class GawiApp:
                         if is_one_time:
                             should_trigger = True
                         else:
+                            validity_tz = item.get('pattern_timezone', item.get('timezone', 'ET')) if item.get('use_start_pattern', 0) else item.get('timezone', 'ET')
                             if self.is_time_valid(now_utc, item['use_active_hours'], item['start_hour'], item['start_minute'],
-                                                  item['end_hour'], item['end_minute'], item['active_days'], item.get('timezone', 'ET')):
+                                                  item['end_hour'], item['end_minute'], item['active_days'], validity_tz):
                                 should_trigger = True
                             else:
-                                next_trig_dt = self.get_next_valid_time(
-                                    now_utc, 0,
-                                    item['use_active_hours'],
-                                    item['start_hour'],
-                                    item['start_minute'],
-                                    item['end_hour'],
-                                    item['end_minute'],
-                                    item['active_days'],
-                                    item.get('timezone', 'ET')
-                                )
+                                if item.get('use_start_pattern', 0):
+                                    next_trig_dt = self.calculate_next_trigger_with_pattern(
+                                        now_utc, item['interval_minutes'],
+                                        1,
+                                        item.get('pattern_hour'),
+                                        item.get('pattern_minute', 0),
+                                        item.get('pattern_timezone', 'ET'),
+                                        item['use_active_hours'],
+                                        item['start_hour'],
+                                        item['start_minute'],
+                                        item['end_hour'],
+                                        item['end_minute'],
+                                        item['active_days'],
+                                        item.get('timezone', 'ET')
+                                    )
+                                else:
+                                    next_trig_dt = self.get_next_valid_time(
+                                        now_utc, 0,
+                                        item['use_active_hours'],
+                                        item['start_hour'],
+                                        item['start_minute'],
+                                        item['end_hour'],
+                                        item['end_minute'],
+                                        item['active_days'],
+                                        item.get('timezone', 'ET')
+                                    )
                                 next_trig = next_trig_dt.strftime("%Y-%m-%d %H:%M:%S")
                                 item['next_trigger'] = next_trig
                                 self.bg_save_item({'id': r_id, 'next_trigger': next_trig})
@@ -2914,7 +2956,8 @@ class GawiApp:
 
                         if should_trigger:
                             self.last_trigger_minute[r_id] = now_str_min
-                            self.active_popups.add(r_id)
+                            with self._popups_lock:
+                                self.active_popups.add(r_id)
                             self.gui_queue.put(('UPDATE_ICON',))
                             self.gui_queue.put(('SHOW_POPUP', r_id, item['title'], item['message'], item['interval_minutes'], 
                                                item['sound'], item['double_check'], item['confirm_msg'], item['popup_bg_color'],
