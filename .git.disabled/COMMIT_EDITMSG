@@ -1,5 +1,0 @@
-fix: align tz_block row baselines + hide redundant (in ET) label
-
-Unified all block row text to same font size (10pt) so baselines
-align. Only show "(in baseline)" when baseline zone differs from
-the block's own zone — removes redundant label.
