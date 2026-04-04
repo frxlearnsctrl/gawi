@@ -1,0 +1,9 @@
+0000000000000000000000000000000000000000 ad53493d2ed3eb78dd76b5ac52444b11b0158889 frxlearnsctrl <frxlearns@gmail.com> 1772892625 +0800	commit (initial): feat: initial commit — Gawi v9.9.2
+ad53493d2ed3eb78dd76b5ac52444b11b0158889 87ac5c2ac2aba0109841187a330fbc063d16e952 frxlearnsctrl <frxlearns@gmail.com> 1772900013 +0800	commit: feat: multi-zone time blocks v9.9.4
+87ac5c2ac2aba0109841187a330fbc063d16e952 fcff938ffc60ab4ff68cbaf297e900c9e850ef86 frxlearnsctrl <frxlearns@gmail.com> 1772916833 +0800	commit: fix: 7 post-review bug fixes for multi-zone time blocks (v9.9.4)
+fcff938ffc60ab4ff68cbaf297e900c9e850ef86 e2845684ed1e4eb51feea5b0700e78b6bb793098 frxlearnsctrl <frxlearns@gmail.com> 1772917686 +0800	commit: fix: snooze_behavior not persisting + cross-midnight conflict detection
+e2845684ed1e4eb51feea5b0700e78b6bb793098 1ff09e35756d4ab46bec258e6e3306082a794374 frxlearnsctrl <frxlearns@gmail.com> 1772921316 +0800	commit: docs: add auto-push rule to CLAUDE.md
+1ff09e35756d4ab46bec258e6e3306082a794374 73d39381812074bc9e2271ebadb7e89f95e63026 frxlearnsctrl <frxlearns@gmail.com> 1773046689 +0800	commit: fix: 9 security + correctness bugs from code review
+73d39381812074bc9e2271ebadb7e89f95e63026 8cfd4852065915080bc0efd8e3f32ad3b2b9f504 frxlearnsctrl <frxlearns@gmail.com> 1773047831 +0800	commit: docs: update CLAUDE.md for v9.9.5 security/correctness fixes
+8cfd4852065915080bc0efd8e3f32ad3b2b9f504 7999eff0734cdc2a59511d1886726841fbd823c1 frxlearnsctrl <frxlearns@gmail.com> 1773048856 +0800	commit: fix: increase tz_blocks row font sizes + padding for readability
+7999eff0734cdc2a59511d1886726841fbd823c1 0bc1a5ce5c3bd29f80694197772a72d5d403a7e8 frxlearnsctrl <frxlearns@gmail.com> 1773049043 +0800	commit: fix: align tz_block row baselines + hide redundant (in ET) label
